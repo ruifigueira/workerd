@@ -1,0 +1,39 @@
+src/workerd/io/worker.c++
+  s_78eaad66234139::t_34ef445aad4016 2535-2536,2538,2541-2542,2544,3577-3578,3581,3614-3615,3617,3629-3632,3663-3665
+src/workerd/api/tests/BUILD.bazel
+  s_de336ef9f9aa9d::t_d41fb795e96c36 189-197
+src/workerd/api/tests/rpc-stub-gc-warning-inspector-test.js
+  s_de336ef9f9aa9d::t_73a7a91d02a5f1 1-60
+src/workerd/api/worker-rpc.c++
+  s_de336ef9f9aa9d::t_14a69110d6f4b7 852-853,889-890
+src/workerd/io/io-context.c++
+  s_de336ef9f9aa9d::t_c3d5c153cc3609 423-425,428-430
+src/workerd/io/io-context.h
+  s_de336ef9f9aa9d::t_9586b32894dd75 394-395,399-400
+src/workerd/io/worker.h
+  s_de336ef9f9aa9d::t_d5450ed0540726 45-46,466-468,472-474,579-582,740-743
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "a9b26073c13a1f351ec6a1bec1c970d253b1baef",
+  "prompts": {},
+  "sessions": {
+    "s_78eaad66234139": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8c67dc26ffeB5VxajSvPFLcPe",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_de336ef9f9aa9d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8c522407ffeB5390Ae0WfL13s",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
