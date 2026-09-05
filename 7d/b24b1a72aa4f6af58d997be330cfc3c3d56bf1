@@ -1,0 +1,19 @@
+src/workerd/io/worker.c++
+  s_78eaad66234139::t_34ef445aad4016 2535-2536,2538,2541-2542,2544,3577-3578,3581,3614-3615,3617,3629-3632,3663-3665
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7db24b1a72aa4f6af58d997be330cfc3c3d56bf1",
+  "prompts": {},
+  "sessions": {
+    "s_78eaad66234139": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8c67dc26ffeB5VxajSvPFLcPe",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
