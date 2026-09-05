@@ -1,0 +1,179 @@
+.bazelrc
+  s_64828acf8d911f::t_a30de210dd9f73 53-55,63-73,78-79,177-179
+build/BUILD.dawn
+  s_64828acf8d911f::t_43c7ea28250d8c 1-1155
+build/BUILD.vulkan_headers
+  s_64828acf8d911f::t_c96223c4536b44 1-21
+build/BUILD.vulkan_utility_libraries
+  s_64828acf8d911f::t_8df5e2a9ce9ab5 1-13
+build/deps/deps.jsonc
+  s_64828acf8d911f::t_659acb25e43897 134-176
+build/deps/gen/deps.MODULE.bazel
+  s_64828acf8d911f::t_8d4f67e5486c91 51-65,162-171,175-196
+build/wd_test.bzl
+  s_64828acf8d911f::t_da29e17aa0bde4 22-23,49
+compile_flags.txt
+  s_64828acf8d911f::t_c20b784a384877 4-5,140
+doxyfile
+  s_cf72bc8665a55a::t_84291eae3b385d 868,1213
+src/workerd/api/global-scope.c++
+  s_64828acf8d911f::t_8630819d80e918 1206-1225
+src/workerd/api/global-scope.h
+  s_64828acf8d911f::t_3ea2d7853f790f 24-27,97-99,131-133,1045-1058
+src/workerd/api/gpu/BUILD.bazel
+  s_64828acf8d911f::t_7296478c13e73b 1-70
+src/workerd/api/gpu/gpu-adapter-info.c++
+  s_64828acf8d911f::t_63bb0a05f927df 1-15
+src/workerd/api/gpu/gpu-adapter-info.h
+  s_64828acf8d911f::t_d4c8bba22f6e00 1-49
+src/workerd/api/gpu/gpu-adapter.c++
+  s_64828acf8d911f::t_e57743e21063e2 1-214
+src/workerd/api/gpu/gpu-adapter.h
+  s_64828acf8d911f::t_e15768adc32b56 1-42
+src/workerd/api/gpu/gpu-async-runner.h
+  s_64828acf8d911f::t_dd7b93fbb1b003 1-76
+src/workerd/api/gpu/gpu-bindgroup-layout.c++
+  s_64828acf8d911f::t_3c4518459ee316 1-134
+src/workerd/api/gpu/gpu-bindgroup-layout.h
+  s_64828acf8d911f::t_2215005200686f 1-82
+src/workerd/api/gpu/gpu-bindgroup.c++
+  s_64828acf8d911f::t_dd5b4109799ca3 1-31
+src/workerd/api/gpu/gpu-bindgroup.h
+  s_64828acf8d911f::t_e39e7104ed47d9 1-59
+src/workerd/api/gpu/gpu-buffer.c++
+  s_64828acf8d911f::t_263aef1f7e18c7 1-160
+src/workerd/api/gpu/gpu-buffer.h
+  s_64828acf8d911f::t_53f4f698e323df 1-111
+src/workerd/api/gpu/gpu-command-buffer.h
+  s_64828acf8d911f::t_c47e495b6edd90 1-32
+src/workerd/api/gpu/gpu-command-encoder.c++
+  s_64828acf8d911f::t_f71e78fb36958d 1-282
+src/workerd/api/gpu/gpu-command-encoder.h
+  s_64828acf8d911f::t_410e8e072b2dba 1-95
+src/workerd/api/gpu/gpu-compute-pass-encoder.c++
+  s_64828acf8d911f::t_2c5bd8b91eabf2 1-47
+src/workerd/api/gpu/gpu-compute-pass-encoder.h
+  s_64828acf8d911f::t_fddb652bdc8c40 1-62
+src/workerd/api/gpu/gpu-compute-pipeline.c++
+  s_64828acf8d911f::t_9a35868298af84 1-12
+src/workerd/api/gpu/gpu-compute-pipeline.h
+  s_64828acf8d911f::t_8efedc466c4213 1-40
+src/workerd/api/gpu/gpu-device.c++
+  s_64828acf8d911f::t_14678015b71833 1-751
+src/workerd/api/gpu/gpu-device.h
+  s_64828acf8d911f::t_745deb9d4b850c 1-153
+src/workerd/api/gpu/gpu-errors.h
+  s_64828acf8d911f::t_a8c037854e3f93 1-84
+src/workerd/api/gpu/gpu-pipeline-layout.h
+  s_64828acf8d911f::t_c11cf9014475f9 1-37
+src/workerd/api/gpu/gpu-query-set.c++
+  s_64828acf8d911f::t_d027cd1c339d5c 1-23
+src/workerd/api/gpu/gpu-query-set.h
+  s_64828acf8d911f::t_4a45f103f91a79 1-39
+src/workerd/api/gpu/gpu-queue.c++
+  s_64828acf8d911f::t_468d1f7503cfd4 1-69
+src/workerd/api/gpu/gpu-queue.h
+  s_64828acf8d911f::t_3e2d20d578082a 1-38
+src/workerd/api/gpu/gpu-render-pass-encoder.c++
+  s_64828acf8d911f::t_9960c866dbc775 1-29
+src/workerd/api/gpu/gpu-render-pass-encoder.h
+  s_64828acf8d911f::t_8bebec83477bdc 1-100
+src/workerd/api/gpu/gpu-render-pipeline.h
+  s_64828acf8d911f::t_2009a875ee7639 1-149
+src/workerd/api/gpu/gpu-sampler.h
+  s_64828acf8d911f::t_d810521b3670b3 1-55
+src/workerd/api/gpu/gpu-shader-module.c++
+  s_64828acf8d911f::t_cef6884f0c86c0 1-37
+src/workerd/api/gpu/gpu-shader-module.h
+  s_64828acf8d911f::t_8eb3e3e86ac1ae 1-119
+src/workerd/api/gpu/gpu-supported-features.c++
+  s_64828acf8d911f::t_caa31223890801 1-28
+src/workerd/api/gpu/gpu-supported-features.h
+  s_64828acf8d911f::t_acc69981e49d53 1-35
+src/workerd/api/gpu/gpu-supported-limits.h
+  s_64828acf8d911f::t_43e1f0c382daab 1-192
+src/workerd/api/gpu/gpu-texture-view.h
+  s_64828acf8d911f::t_54ac63899bafd7 1-47
+src/workerd/api/gpu/gpu-texture.c++
+  s_64828acf8d911f::t_033fb42b6adaa3 1-32
+src/workerd/api/gpu/gpu-texture.h
+  s_64828acf8d911f::t_a23f22fbf02417 1-101
+src/workerd/api/gpu/gpu-utils.c++
+  s_64828acf8d911f::t_7c59913a39a1da 1-1141
+src/workerd/api/gpu/gpu-utils.h
+  s_64828acf8d911f::t_cbab58b228a906 1-159
+src/workerd/api/gpu/gpu.c++
+  s_64828acf8d911f::t_1563b197497670 1-83
+src/workerd/api/gpu/gpu.h
+  s_64828acf8d911f::t_45aebe9b1426d9 1-93
+src/workerd/api/gpu/webgpu-buffer-test.gpu-wd-test
+  s_64828acf8d911f::t_a6a4ab134a3912 1-21
+src/workerd/api/gpu/webgpu-buffer-test.js
+  s_64828acf8d911f::t_9b02611e120f36 1-168
+src/workerd/api/gpu/webgpu-compute-test.gpu-wd-test
+  s_64828acf8d911f::t_90ba6cb96497e4 1-21
+src/workerd/api/gpu/webgpu-compute-test.js
+  s_64828acf8d911f::t_f7d665c2f15fe0 1-298
+src/workerd/api/gpu/webgpu-errors-test.gpu-wd-test
+  s_64828acf8d911f::t_4df95268f92741 1-21
+src/workerd/api/gpu/webgpu-errors-test.js
+  s_64828acf8d911f::t_9204f9ac948cb5 1-105
+src/workerd/api/gpu/webgpu-windowless-test.gpu-wd-test
+  s_64828acf8d911f::t_aabe2a7a5044a0 1-21
+src/workerd/api/gpu/webgpu-windowless-test.js
+  s_cf72bc8665a55a::t_e984a6ab1438f4 1-182
+src/workerd/api/gpu/webgpu-write-test.gpu-wd-test
+  s_64828acf8d911f::t_a4b0217dbbf88a 1-21
+src/workerd/api/gpu/webgpu-write-test.js
+  s_64828acf8d911f::t_c9d2872cdb0198 1-45
+src/workerd/api/rtti.c++
+  s_64828acf8d911f::t_f13ac9be372f71 51-56,93
+src/workerd/io/BUILD.bazel
+  s_cf72bc8665a55a::t_3aff3e9b0bcf15 1,8-18,61-64,79-86,152-155
+src/workerd/io/compatibility-date-test.c++
+  s_64828acf8d911f::t_652a6bfecb3981 255,313
+src/workerd/io/compatibility-date.capnp
+  s_64828acf8d911f::t_0fc63b2a4fa8da 348
+src/workerd/server/BUILD.bazel
+  s_64828acf8d911f::t_4eed6abb5b5a4d 129-132
+src/workerd/server/workerd-api.c++
+  s_64828acf8d911f::t_ff0327f0ed1e20 77-81,154-156
+src/workerd/server/workerd.c++
+  s_64828acf8d911f::t_7a7bea4ca2044c 37-40,1772-1775
+tools/base.eslint.config.mjs
+  s_cf72bc8665a55a::t_83598f6c55ffd3 64-70
+types/generated-snapshot/experimental/index.d.ts
+  s_64828acf8d911f::t_5faf07969db937 392-401,588,3978-5028
+types/generated-snapshot/experimental/index.ts
+  s_64828acf8d911f::t_4ca0e8072d1eb7 392-401,590,3987-5037
+types/generated-snapshot/index.d.ts
+  s_64828acf8d911f::t_ecd87a4ce4cca3 394-403,588,3891-4941
+types/generated-snapshot/index.ts
+  s_64828acf8d911f::t_dabaf3045ea8d8 394-403,590,3900-4950
+types/src/generator/type.ts
+  s_64828acf8d911f::t_7cc6edd7969061 109,112,118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "78aea3adde44a0c43f261c257fb1729089fb622f",
+  "prompts": {},
+  "sessions": {
+    "s_64828acf8d911f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0016c763fffeN2kYm2BilgrFZt",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_cf72bc8665a55a": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_00382b600ffeKKvCWdmK9ZTiAt",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
