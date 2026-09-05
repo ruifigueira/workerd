@@ -1,0 +1,65 @@
+docs/live-isolate-checkpoint.md
+  s_38a0bf52e4dc1d::t_f22ac28596c08f 1-450
+src/workerd/api/tests/BUILD.bazel
+  s_38a0bf52e4dc1d::t_1fc5d6f844fc68 1144-1150
+src/workerd/api/tests/worker-loader-snapshot-test.js
+  s_b0543230c87a1f::t_482e2512727aac 1-37
+src/workerd/api/tests/worker-loader-snapshot-test.wd-test
+  s_b0543230c87a1f::t_ef57058c2ebe03 1-17
+src/workerd/io/compatibility-date.capnp
+  s_b0543230c87a1f::t_601d261d86ab38 1675-1679
+src/workerd/io/worker.c++
+  s_c4d3e3326d6de4::t_d333cb52f8ed87 650-655
+src/workerd/jsg/jsg.h
+  s_b0543230c87a1f::t_e9f5ddd2739b3c 2154-2156
+src/workerd/jsg/resource.c++
+  s_b0543230c87a1f::t_88ce31b9c28df4 10-15
+src/workerd/jsg/resource.h
+  s_c4d3e3326d6de4::t_0d92dee02cc6c4 50-56,1698-1799,1893-1895,1907-1910,2040-2042,2064,2109-2112,2150-2161,2176,2258-2434
+src/workerd/jsg/setup-test.c++
+  s_38a0bf52e4dc1d::t_dc75d9995c2c85 7-8,81-125,146-287
+src/workerd/jsg/setup.c++
+  s_38a0bf52e4dc1d::t_1bdb0e347890b8 276,396-401,427-434,439-463,468-470,472-476,478-483,540-548,550-552,565-566,574-626,658
+src/workerd/jsg/setup.h
+  s_38a0bf52e4dc1d::t_eb256c74d87f82 18,38-69,387-390,416,426,432-437,477-481,483-486,490-492,644-646,674-689,793-795,800-802,817-819,824-826,908,1070-1086,1090-1091,1171-1179
+src/workerd/jsg/type-wrapper.h
+  s_c4d3e3326d6de4::t_161c0b7bb22bd7 613-622,631-639
+src/workerd/server/server.c++
+  s_c4d3e3326d6de4::t_b2b8c8c9031932 5750-5752
+src/workerd/server/workerd-api.c++
+  s_38a0bf52e4dc1d::t_2120bd6a0a4641 223,230-231,248,259-261,265-268,271,274-282,307-309,317-319
+src/workerd/server/workerd-api.h
+  s_b0543230c87a1f::t_7b433958229a15 10,47-49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "490f5ada563ddeb8fa38a4b84a1439be03174ecf",
+  "prompts": {},
+  "sessions": {
+    "s_38a0bf52e4dc1d": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8e4b47a7ffeVSUDRGBOtAte1Z",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_b0543230c87a1f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f92f66076ffeqbpoynrrmnYTtp",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_c4d3e3326d6de4": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8e66360bffe9J6RRcBPO5qJHw",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
