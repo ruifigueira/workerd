@@ -1,0 +1,31 @@
+src/workerd/api/worker-loader.c++
+  s_fec02d7784a34e::t_057af452276797 173,225,227,250-266,268-273,275-282,284-291,295,297-349,351-353,355-356,358-363,409-416
+src/workerd/jsg/modules-new.c++
+  s_fec02d7784a34e::t_02755354998ed0 21-40,795-819,834-848,926-929,977-994,1267,1306-1311,1344-1345,1393-1396,1718,1833,1835-1837,1840-1843,1856-1896,1900,1903-1910,1913,1916-1917,2032-2038,2345-2353,2363,2366-2393,2447-2450,2473,2513,2519-2523,2539-2540,2542-2544,2548-2550,2626-2646,2705-2708
+src/workerd/server/workerd-api.c++
+  s_fec02d7784a34e::t_9a7196c2f842f9 873-950,958-959,1135-1137,1146-1153
+types/generated-snapshot/experimental/index.d.ts
+  s_fec02d7784a34e::t_968bd4f4226021 4466
+types/generated-snapshot/experimental/index.ts
+  s_fec02d7784a34e::t_7f7a37774eec3f 4475
+types/generated-snapshot/index.d.ts
+  s_fec02d7784a34e::t_e0c52ddc7bcfb6 4189
+types/generated-snapshot/index.ts
+  s_fec02d7784a34e::t_f62321e4799d30 4198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "3afbe3618d0c0b684df54c8017e8a2422b0e3fdb",
+  "prompts": {},
+  "sessions": {
+    "s_fec02d7784a34e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8a7b89feffeUbZSZJRbZrDWlK",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
