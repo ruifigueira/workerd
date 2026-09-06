@@ -1672,4 +1672,13 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # When enabled, a Worker whose entrypoint is Python are automatically
   # considered as a Python Worker. This flag will be obsoleted once the feature
   # is stable.
+
+  dynamicWorkerAsyncStartup @190 :Bool
+      $compatEnableFlag("dynamic_worker_async_startup")
+      $experimental;
+  # Defers a dynamically-loaded Worker's main-module evaluation until its first request. The
+  # module evaluates in the loaded Worker's I/O context, which permits asynchronous top-level I/O.
+  # Modules loaded with a dynamic import() at request time also evaluate in the request's I/O
+  # context. Requires the new module registry for the dynamic import() behavior.
+  # Workers defined in the static configuration do not defer startup.
 }

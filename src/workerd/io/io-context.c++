@@ -152,7 +152,8 @@ class IoContext::TimeoutManagerImpl::TimeoutState {
 IoContext::IoContext(ThreadContext& thread,
     kj::Own<const Worker> workerParam,
     kj::Maybe<Worker::Actor&> actorParam,
-    kj::Own<LimitEnforcer> limitEnforcerParam)
+    kj::Own<LimitEnforcer> limitEnforcerParam,
+    TagPromises tagPromises)
     : thread(thread),
       worker(kj::mv(workerParam)),
       actor(actorParam),
@@ -164,6 +165,7 @@ IoContext::IoContext(ThreadContext& thread,
       timeoutManager(kj::heap<TimeoutManagerImpl>()),
       waitUntilTasks(*this),
       tasks(*this),
+      tagPromises(tagPromises),
       deleteQueueSignalTask(startDeleteQueueSignalTask(this)) {
   kj::PromiseFulfillerPair<void> paf = kj::newPromiseAndFulfiller<void>();
   abortFulfiller = kj::mv(paf.fulfiller);
@@ -1361,21 +1363,28 @@ void IoContext::runInContextScope(Worker::LockType lockType,
     currentLock = lock;
 
     JSG_WITHIN_CONTEXT_SCOPE(lock, lock.getContext(), [&](jsg::Lock& js) {
-      v8::Isolate::PromiseContextScope promiseContextScope(
-          lock.getIsolate(), getPromiseContextTag(lock));
-
-      {
-        // Handle any pending deletions that arrived while the worker was processing a different
-        // request.
-        auto l = deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
-        auto& state = KJ_ASSERT_NONNULL(*l);
-        for (auto& object: state.queue) {
-          OwnedObjectList::unlink(*object);
+      auto body = [&]() {
+        {
+          // Handle any pending deletions that arrived while the worker was processing a different
+          // request.
+          auto l = deleteQueue.queue->crossThreadDeleteQueue.lockExclusive();
+          auto& state = KJ_ASSERT_NONNULL(*l);
+          for (auto& object: state.queue) {
+            OwnedObjectList::unlink(*object);
+          }
+          state.queue.clear();
         }
-        state.queue.clear();
-      }
 
-      func(lock);
+        func(lock);
+      };
+
+      if (tagPromises == TagPromises::YES) {
+        v8::Isolate::PromiseContextScope promiseContextScope(
+            lock.getIsolate(), getPromiseContextTag(lock));
+        body();
+      } else {
+        body();
+      }
     });
   });
 }

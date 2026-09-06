@@ -345,6 +345,9 @@ Server::~Server() noexcept {
   for (auto& service: services) {
     service.value->unlink();
   }
+  workerLoaderNamespaces.clear();
+  anonymousWorkerLoaderNamespaces.clear();
+  tasks.clear();
 
   // Verify that unlinking actually eliminated cycles. Otherwise we have a memory leak -- and
   // potentially use-after-free if we allow the `Server` to be destroyed while services still
@@ -5174,6 +5177,8 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
   }
 
  private:
+  friend class Server;
+
   Server& server;
   kj::String namespaceName;
 
@@ -5217,23 +5222,247 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     }
   };
 
+  class DynamicWorkerAbortState final: public kj::Refcounted {
+   public:
+    DynamicWorkerAbortState(kj::Maybe<kj::Function<void()>> callback): callback(kj::mv(callback)) {}
+
+    void abort() {
+      KJ_IF_SOME(cb, callback) {
+        auto func = kj::mv(cb);
+        callback = kj::none;
+        func();
+      }
+    }
+
+    void clear() {
+      callback = kj::none;
+    }
+
+   private:
+    kj::Maybe<kj::Function<void()>> callback;
+  };
+
+  class StartupIoChannelFactory final: public IoChannelFactory, private TimerChannel {
+   public:
+    StartupIoChannelFactory(Server& server,
+        kj::Array<kj::Own<SubrequestChannel>> subrequestChannels,
+        kj::Array<kj::Own<ActorClassChannel>> actorClassChannels,
+        kj::Array<kj::Own<RpcChannel>> rpcChannels,
+        kj::Rc<DynamicWorkerAbortState> abortState)
+        : server(server),
+          subrequestChannels(kj::mv(subrequestChannels)),
+          actorClassChannels(kj::mv(actorClassChannels)),
+          rpcChannels(kj::mv(rpcChannels)),
+          abortState(kj::mv(abortState)) {}
+
+    kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) override {
+      KJ_REQUIRE(channel < subrequestChannels.size(), "invalid startup subrequest channel");
+      return subrequestChannels[channel]->startRequest(kj::mv(metadata));
+    }
+
+    capnp::Capability::Client getCapability(uint channel) override {
+      KJ_FAIL_REQUIRE("Dynamic workers do not have capability channels");
+    }
+
+    kj::Own<CacheClient> getCache() override {
+      JSG_FAIL_REQUIRE(Error, "No Cache was configured");
+    }
+
+    TimerChannel& getTimer() override {
+      return *this;
+    }
+
+    kj::Promise<void> writeLogfwdr(
+        uint channel, kj::FunctionParam<void(capnp::AnyPointer::Builder)> buildMessage) override {
+      JSG_FAIL_REQUIRE(Error, "Dynamic worker startup does not have logfwdr channels");
+    }
+
+    kj::Own<SubrequestChannel> getSubrequestChannelResolved(uint channel,
+        kj::Maybe<Frankenvalue> props,
+        kj::Maybe<VersionRequest> versionRequest,
+        Persistent persistent) override {
+      KJ_REQUIRE(channel < subrequestChannels.size(), "invalid startup subrequest channel");
+      JSG_REQUIRE(props == kj::none && versionRequest == kj::none, TypeError,
+          "Startup channels cannot be specialized");
+      return kj::addRef(*subrequestChannels[channel]);
+    }
+
+    kj::Own<ActorChannel> getGlobalActor(uint channel,
+        const ActorIdFactory::ActorId& id,
+        kj::Maybe<kj::String> locationHint,
+        ActorGetMode mode,
+        bool enableReplicaRouting,
+        ActorRoutingMode routingMode,
+        SpanParent parentSpan,
+        kj::Maybe<ActorVersion> version,
+        Persistent persistent) override {
+      JSG_FAIL_REQUIRE(Error, "Dynamic workers do not have actor namespace bindings");
+    }
+
+    kj::Own<ActorChannel> getColoLocalActor(
+        uint channel, kj::StringPtr id, SpanParent parentSpan) override {
+      JSG_FAIL_REQUIRE(Error, "Dynamic workers do not have actor namespace bindings");
+    }
+
+    kj::Own<ActorClassChannel> getActorClassResolved(
+        uint channel, kj::Maybe<Frankenvalue> props, Persistent persistent) override {
+      KJ_REQUIRE(channel < actorClassChannels.size(), "invalid startup actor class channel");
+      JSG_REQUIRE(
+          props == kj::none, TypeError, "Startup actor class channels cannot be specialized");
+      return kj::addRef(*actorClassChannels[channel]);
+    }
+
+    kj::Own<RpcChannel> getRpcChannel(uint channel) override {
+      KJ_REQUIRE(channel < rpcChannels.size(), "invalid startup RPC channel");
+      return kj::addRef(*rpcChannels[channel]);
+    }
+
+    kj::Own<SubrequestChannel> subrequestChannelFromToken(
+        ChannelTokenUsage usage, kj::ArrayPtr<const byte> token) override {
+      return server.channelTokenHandler.decodeSubrequestChannelToken(usage, token);
+    }
+
+    kj::Own<ActorClassChannel> actorClassFromToken(
+        ChannelTokenUsage usage, kj::ArrayPtr<const byte> token) override {
+      return server.channelTokenHandler.decodeActorClassChannelToken(usage, token);
+    }
+
+    kj::Own<RpcChannel> rpcChannelFromToken(
+        ChannelTokenUsage usage, kj::ArrayPtr<const byte> token) override {
+      return server.channelTokenHandler.decodeRpcChannelToken(usage, token);
+    }
+
+    kj::Own<SubrequestChannel> makeRestoredSubrequestChannelResolved(
+        kj::Own<SelfTokenFactory> selfTokenFactory,
+        Frankenvalue restoreParams,
+        kj::Own<SubrequestChannel> inner,
+        Persistent persistent) override {
+      return server.channelTokenHandler.makeRestoredSubrequestChannel(
+          kj::mv(selfTokenFactory), kj::mv(restoreParams), kj::mv(inner), persistent);
+    }
+
+    kj::Own<RpcChannel> makeRestoredRpcChannelResolved(kj::Own<SelfTokenFactory> selfTokenFactory,
+        Frankenvalue restoreParams,
+        Persistent persistent) override {
+      return server.channelTokenHandler.makeRestoredRpcChannel(
+          kj::mv(selfTokenFactory), kj::mv(restoreParams), persistent);
+    }
+
+    void abortIsolate(kj::StringPtr reason) noexcept override {
+      abortState->abort();
+    }
+
+   private:
+    Server& server;
+    kj::Array<kj::Own<SubrequestChannel>> subrequestChannels;
+    kj::Array<kj::Own<ActorClassChannel>> actorClassChannels;
+    kj::Array<kj::Own<RpcChannel>> rpcChannels;
+    kj::Rc<DynamicWorkerAbortState> abortState;
+
+    void syncTime() override {}
+
+    kj::Date now(kj::Maybe<kj::Date>) override {
+      return kj::systemPreciseCalendarClock().now();
+    }
+
+    kj::Promise<void> atTime(kj::Date when) override {
+      auto delay = when - now(kj::none);
+      return server.globalContext->threadContext.getUnsafeTimer().atTime(
+          server.monotonicClock.now() + delay);
+    }
+
+    kj::Promise<void> afterLimitTimeout(kj::Duration timeout) override {
+      return server.globalContext->threadContext.getUnsafeTimer().afterDelay(timeout);
+    }
+
+    kj::TimePoint nowForLimitTimeout() override {
+      return server.monotonicClock.now();
+    }
+  };
+
+  class StartupLimitEnforcer final: public LimitEnforcer {
+   public:
+    kj::Own<void> enterJs(jsg::Lock& lock, IoContext& context) override {
+      return {};
+    }
+    void topUpActor() override {}
+    void newSubrequest(bool isInHouse) override {}
+    void newKvRequest(KvOpType op) override {}
+    void newAnalyticsEngineRequest() override {}
+    kj::Promise<void> limitDrain() override {
+      return kj::NEVER_DONE;
+    }
+    kj::Promise<void> limitScheduled() override {
+      return kj::NEVER_DONE;
+    }
+    kj::Duration getAlarmLimit() override {
+      return 15 * kj::MINUTES;
+    }
+    size_t getBufferingLimit() override {
+      return kj::maxValue;
+    }
+    kj::Maybe<EventOutcome> getLimitsExceeded() override {
+      return kj::none;
+    }
+    kj::Promise<void> onLimitsExceeded() override {
+      return kj::NEVER_DONE;
+    }
+    void setCpuLimitNearlyExceededCallback(kj::Function<void()> callback) override {}
+    void requireLimitsNotExceeded() override {}
+    void reportMetrics(RequestObserver& requestMetrics) override {}
+    kj::Duration consumeTimeElapsedForPeriodicLogging() override {
+      return 0 * kj::SECONDS;
+    }
+    size_t getSqliteMemoryUsage() const override {
+      return 0;
+    }
+  };
+
   class WorkerStubImpl final: public WorkerStubChannel {
+    class FirstRequestGate final {
+     public:
+      FirstRequestGate()
+          : request(kj::newPromiseAndFulfiller<void>()),
+            parkedPaf(kj::newPromiseAndFulfiller<void>()),
+            parked(kj::mv(parkedPaf.promise).fork()) {}
+
+      kj::Promise<void> wait() {
+        if (parkedPaf.fulfiller->isWaiting()) parkedPaf.fulfiller->fulfill();
+        return kj::mv(request.promise);
+      }
+
+      kj::Promise<void> whenParked() {
+        return parked.addBranch();
+      }
+
+      void signal() {
+        if (request.fulfiller->isWaiting()) request.fulfiller->fulfill();
+      }
+
+     private:
+      kj::PromiseFulfillerPair<void> request;
+      kj::PromiseFulfillerPair<void> parkedPaf;
+      kj::ForkedPromise<void> parked;
+    };
+
    public:
     WorkerStubImpl(Server& server,
         kj::String isolateName,
         kj::Maybe<kj::Function<void()>> onAborted,
         kj::Function<kj::Promise<DynamicWorkerSource>()> fetchSource)
-        : onAborted(kj::mv(onAborted)),
+        : firstRequestGate(),
+          abortState(kj::rc<DynamicWorkerAbortState>(kj::mv(onAborted))),
           startupTask(start(server, kj::mv(isolateName), kj::mv(fetchSource)).fork()),
           cleanupTaskSet(server.tasks) {}
 
     // Returns a branch of the startup task promise. Used by the namespace to
     // hold an extra reference to unnamed stubs until startup completes.
     kj::Promise<void> whenStartupDone() {
-      return startupTask.addBranch();
+      return startupTask.addBranch().exclusiveJoin(firstRequestGate.whenParked());
     }
 
     ~WorkerStubImpl() {
+      abortState->clear();
       // Defer unlink and destruction of `WorkerService` to the next turn of the event loop. This
       // is needed because worker stubs are typically destroyed while some other isolate is
       // current, and so we cannot enter the dynamic worker's isolate to tear it down. It's even
@@ -5268,23 +5497,15 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     }
 
    private:
-    // Callback to remove the worker stub from the isolates map. None for
-    // unnamed dynamic isolates.
-    kj::Maybe<kj::Function<void()>> onAborted;
+    FirstRequestGate firstRequestGate;
+
+    kj::Rc<DynamicWorkerAbortState> abortState;
 
     kj::Maybe<kj::Own<WorkerService>> service;  // null if still starting up
     kj::ForkedPromise<void> startupTask;        // resolves when `service` is non-null
 
     kj::TaskSet& cleanupTaskSet;
     bool unlinked = false;
-
-    void onAbortIsolate() {
-      KJ_IF_SOME(cb, onAborted) {
-        auto callback = kj::mv(cb);
-        onAborted = kj::none;
-        callback();
-      }
-    }
 
     kj::Promise<void> start(Server& server,
         kj::String isolateName,
@@ -5297,6 +5518,9 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       kj::Vector<FutureSubrequestChannel> subrequestChannels;
       kj::Vector<FutureActorClassChannel> actorClassChannels;
       kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> rpcChannels;
+      kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> startupSubrequestChannels;
+      kj::Vector<kj::Own<IoChannelFactory::ActorClassChannel>> startupActorClassChannels;
+      kj::Vector<kj::Own<IoChannelFactory::RpcChannel>> startupRpcChannels;
       source.env.rewriteCaps([&](kj::Own<Frankenvalue::CapTableEntry> entry) {
         KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::SubrequestChannel>(*entry)) {
           uint channelNumber =
@@ -5305,6 +5529,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
             .designator = kj::addRef(channel),
             .errorContext = kj::str("Worker's env"),
           });
+          startupSubrequestChannels.add(kj::addRef(channel));
           return kj::heap<IoChannelCapTableEntry>(
               IoChannelCapTableEntry::SUBREQUEST, channelNumber);
         } else KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::ActorClassChannel>(*entry)) {
@@ -5313,11 +5538,13 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
             .designator = kj::addRef(channel),
             .errorContext = kj::str("Worker's env"),
           });
+          startupActorClassChannels.add(kj::addRef(channel));
           return kj::heap<IoChannelCapTableEntry>(
               IoChannelCapTableEntry::ACTOR_CLASS, channelNumber);
         } else KJ_IF_SOME(channel, kj::tryDowncast<IoChannelFactory::RpcChannel>(*entry)) {
           uint channelNumber = rpcChannels.size();
           rpcChannels.add(kj::addRef(channel));
+          startupRpcChannels.add(kj::addRef(channel));
           return kj::heap<IoChannelCapTableEntry>(IoChannelCapTableEntry::RPC, channelNumber);
         } else {
           // Generally, it shouldn't be possible to get here, but just in case, let's at least
@@ -5328,6 +5555,25 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         }
       });
 
+      bool deferModuleEvaluation = source.compatibilityFlags.getDynamicWorkerAsyncStartup();
+      auto globalOutbound = kj::mv(source.globalOutbound).orDefault([]() {
+        return kj::refcounted<NullGlobalOutboundChannel>();
+      });
+
+      kj::Maybe<kj::Rc<IoChannelFactory>> startupIoChannels;
+      if (deferModuleEvaluation) {
+        kj::Vector<kj::Own<IoChannelFactory::SubrequestChannel>> channels(
+            startupSubrequestChannels.size() + IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT);
+        channels.add(kj::addRef(*globalOutbound));
+        channels.add(kj::addRef(*globalOutbound));
+        for (auto& channel: startupSubrequestChannels) {
+          channels.add(kj::mv(channel));
+        }
+        startupIoChannels = kj::rc<StartupIoChannelFactory>(server, channels.releaseAsArray(),
+            startupActorClassChannels.releaseAsArray(), startupRpcChannels.releaseAsArray(),
+            abortState.addRef());
+      }
+
       WorkerDef def{
         .featureFlags = source.compatibilityFlags,
         .source = kj::mv(source.source),
@@ -5337,8 +5583,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
         // clang-format off
         .globalOutbound{
-          .designator = kj::mv(source.globalOutbound)
-              .orDefault([]() { return kj::refcounted<NullGlobalOutboundChannel>(); }),
+          .designator = kj::mv(globalOutbound),
           .errorContext = kj::str("Worker's globalOutbound"),
         },
 
@@ -5372,13 +5617,20 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         .maybeOwnedSourceCode = kj::mv(source.ownContent),
         // The callback is owned by the WorkerService, which is owned by `this`, so a raw
         // pointer is safe.
-        .abortIsolateCallback = kj::Function<void()>([this]() { onAbortIsolate(); }),
+        .abortIsolateCallback = kj::Function<void()>([abortState = abortState.addRef()]() mutable {
+          abortState->abort();
+        }),
         // clang-format on
       };
 
       DynamicErrorReporter errorReporter;
 
-      auto service = co_await server.makeWorkerImpl(isolateName, kj::mv(def), {}, errorReporter);
+      if (deferModuleEvaluation) {
+        co_await firstRequestGate.wait();
+      }
+
+      auto service = co_await server.makeWorkerImpl(
+          isolateName, kj::mv(def), {}, errorReporter, kj::mv(startupIoChannels));
       errorReporter.throwIfErrors();
 
       service->link(errorReporter);
@@ -5397,6 +5649,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
 
       kj::Own<WorkerInterface> startRequest(
           IoChannelFactory::SubrequestMetadata metadata) override {
+        isolate->firstRequestGate.signal();
         if (isolate->service == kj::none) {
           // Capture a refcounted reference rather than a raw `this` pointer so that the
           // SubrequestChannelImpl is kept alive until the startup task resolves, even if the
@@ -5471,6 +5724,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       }
 
       kj::Maybe<kj::Promise<void>> whenReady() override {
+        isolate->firstRequestGate.signal();
         if (inner != kj::none) return kj::none;
 
         KJ_IF_SOME(service, isolate->service) {
@@ -5679,7 +5933,8 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
 kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr name,
     WorkerDef def,
     capnp::List<config::Extension>::Reader extensions,
-    ErrorReporter& errorReporter) {
+    ErrorReporter& errorReporter,
+    kj::Maybe<kj::Rc<IoChannelFactory>> startupIoChannels) {
   // Load Python artifacts if this is a Python worker.
   co_await preloadPython(name, def, errorReporter);
 
@@ -5834,7 +6089,24 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
   };
   auto worker = kj::atomicRefcounted<Worker>(kj::mv(script), kj::atomicRefcounted<WorkerObserver>(),
       kj::mv(compileBindings), IsolateObserver::StartType::COLD, SpanParent(nullptr),
-      Worker::Lock::TakeSynchronously(kj::none), errorReporter);
+      Worker::Lock::TakeSynchronously(kj::none), errorReporter, kj::none,
+      DeferModuleEvaluation(startupIoChannels != kj::none));
+
+  KJ_IF_SOME(channels, startupIoChannels) {
+    // This context ends when startup completes, but module-scope promises created here live for
+    // the life of the Worker and may be settled by later requests. Leave them untagged so that
+    // settling them does not defer to a context that no longer exists.
+    auto context =
+        kj::refcounted<IoContext>(globalContext->threadContext, kj::atomicAddRef(*worker), kj::none,
+            kj::heap<WorkerLoaderNamespace::StartupLimitEnforcer>(), IoContext::TagPromises::NO);
+    auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
+        kj::mv(channels), kj::refcounted<RequestObserver>(), kj::none, kj::none);
+    incomingRequest->delivered();
+    KJ_DEFER(incomingRequest->drain(tasks, kj::mv(incomingRequest)));
+    co_await context->run([](Worker::Lock& lock, IoContext& context) {
+      return context.awaitJs(lock, lock.evaluateDeferredModule());
+    });
+  }
 
   uint totalActorChannels = 0;
 

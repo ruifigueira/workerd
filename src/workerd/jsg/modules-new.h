@@ -161,13 +161,10 @@ namespace workerd::jsg::modules {
 // means it will not be possible to import worker bundle modules from a
 // built-in.
 //
-// The ModuleRegistry evaluates modules synchronously and all modules are
-// evaluated outside of the current IoContext (if any). This means the
-// evaluation of any module cannot perform any i/o and therefore is expected
-// to resolve synchronously. This allows for both ESM and CommonJS style
-// imports/requires. However, this also means that module bundles that do need
-// to be resolved, loaded, and evaluated asynchronously (like the fallback
-// service) must make appropriate arrangements to be able to do so.
+// The ModuleRegistry normally evaluates modules outside the current IoContext.
+// Dynamic imports and deferred main-module evaluation can preserve the current
+// context. Those paths support top-level await and I/O. CommonJS require remains
+// synchronous. CommonJS modules without Flag::EVAL evaluate directly.
 //
 // Metrics can be collected for module loading and resolution.
 //
@@ -228,6 +225,7 @@ struct ResolveContext final {
 };
 
 class ModuleRegistry;
+WD_STRONG_BOOL(PreserveIoContext);
 
 // The abstraction of a module within the ModuleRegistry.
 // Importantly, a Module is immutable once created and must be thread-safe.
@@ -273,16 +271,15 @@ class Module {
     // A Module with the ESM flag set is interpreted as an ECMAScript module.
     ESM = 1 << 1,
     // A Module with the EVAL flag set is interpreted as a module that requires
-    // code evaluation to complete. This is generally used for synthetic modules
-    // that require JavaScript evaluation outside of the current request context.
-    // The eval callback must be set or the flag is ignored.
+    // embedder-managed code evaluation to complete. The eval callback must be
+    // set or the flag is ignored.
     EVAL = 1 << 2,
     // A Module with the WASM flag set is a WebAssembly module.
     WASM = 1 << 3,
   };
 
-  // The Evaluator is used to to ensure evaluation of a module outside of an
-  // IoContext, when necessary.
+  // The Evaluator controls whether embedder-managed module evaluation preserves
+  // the current IoContext.
   class Evaluator final {
    public:
     KJ_DISALLOW_COPY_AND_MOVE(Evaluator);
@@ -292,8 +289,11 @@ class Module {
         const CompilationObserver& observer) const;
 
    private:
-    Evaluator(const ModuleRegistry& registry): registry(registry) {}
+    Evaluator(const ModuleRegistry& registry, PreserveIoContext preserveIoContext)
+        : registry(registry),
+          preserveIoContext(preserveIoContext) {}
     const ModuleRegistry& registry;
+    PreserveIoContext preserveIoContext;
     friend class ModuleRegistry;
   };
 
@@ -316,8 +316,8 @@ class Module {
   // If isMain() returns true, then import.meta.main will be true for this module
   bool isMain() const;
 
-  // If isEval() returns true, then the module requires code evaluation to complete
-  // outside of a request context (that is, it cannot perform certain I/O tasks).
+  // If isEval() returns true, then the module requires embedder-managed code
+  // evaluation to complete.
   bool isEval() const;
 
   // If isWasm() returns true, then the module is a WebAssembly module.
@@ -383,10 +383,9 @@ class Module {
   };
 
   // The EvaluateCallback is used to evaluate a synthetic module. The callback
-  // is called after the module is resolved and instantiated. Note that this
-  // is different from the Module::Evaluator, which is used to ensure that
-  // evaluation of a module occurs outside of an IoContext. This callback
-  // is always called to actually perform the evaluation of a synthetic module.
+  // is called after the module is resolved and instantiated. This differs from
+  // Module::Evaluator, which selects the IoContext policy for module evaluation.
+  // This callback always performs the evaluation of a synthetic module.
   // If false is returned, then an exception should have been scheduled on the isolate.
   using EvaluateCallback =
       Function<bool(const Url&, const ModuleNamespace&, const CompilationObserver&)>;
@@ -694,11 +693,9 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   enum BundleIndices { kBundle, kBuiltin, kBuiltinOnly, kFallback, kBundleCount };
 
  public:
-  // The EvalCallback is used to to ensure evaluation of a module outside of an
-  // IoContext, when necessary. If the EvalCallback is not set, then the
-  // Flag::EVAL on a module is ignored. If the EvalCallback is set, then any
-  // Modules that have the Flag::EVAL set will have their evaluation deferred
-  // to this callback.
+  // An EvalCallback lets the embedder control the IoContext policy during module
+  // evaluation. If no callback is set, the Flag::EVAL on a module is ignored.
+  // Modules with Flag::EVAL defer their evaluation to the selected callback.
   using EvalCallback = Function<jsg::JsPromise(
       const Module& module, v8::Local<v8::Module> v8Module, const CompilationObserver& observer)>;
 
@@ -721,6 +718,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
     kj::Arc<ModuleRegistry> finish() KJ_WARN_UNUSED_RESULT;
 
     Builder& setEvalCallback(EvalCallback callback) KJ_LIFETIMEBOUND;
+    Builder& setIoContextEvalCallback(EvalCallback callback) KJ_LIFETIMEBOUND;
 
     capnp::SchemaLoader& getSchemaLoader() {
       return *schemaLoader;
@@ -734,6 +732,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
     const Options options;
     kj::FixedArray<kj::Vector<kj::Own<ModuleBundle>>, ModuleRegistry::kBundleCount> bundles_;
     kj::Maybe<EvalCallback> maybeEvalCallback = kj::none;
+    kj::Maybe<EvalCallback> maybeIoContextEvalCallback = kj::none;
     kj::Own<capnp::SchemaLoader> schemaLoader;
     friend class ModuleRegistry;
   };
@@ -772,6 +771,8 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
       UnwrapDefault unwrapDefault = UnwrapDefault::NO,
       RequireEsm requireEsm = RequireEsm::NO);
 
+  static kj::Maybe<Promise<Value>> tryResolveMainModuleAsync(Lock& js, kj::StringPtr specifier);
+
   // The constructor is public because kj::heap requires is to be. Do not
   // use the constructor directly. Use the ModuleRegistry::Builder
   ModuleRegistry(ModuleRegistry::Builder* builder);
@@ -785,8 +786,9 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
     return *schemaLoader;
   }
 
-  const Module::Evaluator getEvaluator() const {
-    return Module::Evaluator(*this);
+  const Module::Evaluator getEvaluator(
+      PreserveIoContext preserveIoContext = PreserveIoContext::NO) const {
+    return Module::Evaluator(*this, preserveIoContext);
   }
 
  private:
@@ -806,6 +808,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   // and must not rely on captured mutable state (the workerd callback captures
   // nothing).
   mutable kj::Maybe<EvalCallback> maybeEvalCallback = kj::none;
+  mutable kj::Maybe<EvalCallback> maybeIoContextEvalCallback = kj::none;
   kj::Own<capnp::SchemaLoader> schemaLoader;
 
   struct ModuleRef {
@@ -835,7 +838,8 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   kj::Maybe<jsg::JsPromise> evaluateImpl(jsg::Lock& js,
       const Module& module,
       v8::Local<v8::Module> v8Module,
-      const CompilationObserver& observer) const;
+      const CompilationObserver& observer,
+      PreserveIoContext preserveIoContext) const;
 
   friend class Module::Evaluator;
 };

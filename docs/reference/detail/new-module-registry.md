@@ -71,7 +71,8 @@ ModuleRegistry (kj::AtomicRefcounted)
   |-- observer: const ResolveObserver&     (metrics hooks)
   |-- bundleBase: const jsg::Url&          (e.g. "file:///bundle/")
   |-- schemaLoader: capnp::SchemaLoader    (for capnp modules)
-  |-- maybeEvalCallback: EvalCallback      (ensures eval outside IoContext)
+  |-- maybeEvalCallback: EvalCallback      (suppresses the current IoContext)
+  |-- maybeIoContextEvalCallback           (preserves the current IoContext)
   +-- impl: kj::MutexGuarded<Impl>
         +-- bundles: FixedArray<Array<Own<ModuleBundle>>, 4>
               [kBundle]      -> worker bundle modules
@@ -135,7 +136,7 @@ map to multiple rows, so a unique URL index would collide.
 | `NONE` | 0x00 | No flags                                                           |
 | `MAIN` | 0x01 | `import.meta.main = true` (worker entrypoint)                      |
 | `ESM`  | 0x02 | ECMAScript module (vs synthetic)                                   |
-| `EVAL` | 0x04 | Requires evaluation outside IoContext (deferred to `EvalCallback`) |
+| `EVAL` | 0x04 | Requires embedder-managed evaluation through an `EvalCallback`    |
 | `WASM` | 0x08 | WebAssembly module                                                 |
 
 ### `Module::ContentType` enum
@@ -190,7 +191,7 @@ matching `v8::String::NewFromUtf8`'s tolerance and the legacy registry. The
 encoding choice is a pure function of the source bytes, so all replicas agree
 and the shared compile cache stays consistent.
 - `evaluate()`: Calls `v8::Module::Evaluate()`. For modules with `Flags::EVAL`,
-  delegates to the `Evaluator` to run evaluation outside the IoContext.
+  it delegates to the `Evaluator`. The caller selects the IoContext policy.
 - Always has `Flags::ESM | Flags::EVAL` set.
 
 #### Compile Cache Flow
@@ -385,7 +386,7 @@ User code: const mod = await import('./bar.js')
       bundle module.
    b. Build ResolveContext { type from referrer's module, source=DYNAMIC_IMPORT, ... }
    c. findResolved or resolveWithCaching (same as static)
-   d. Call module.evaluate(js, v8Module, observer, maybeEvaluate) -> Promise
+   d. Call module.evaluate() with `PreserveIoContext::YES` -> Promise
    e. Chain: .then(namespace -> resolve Promise with module namespace)
 
 6. Return Promise to V8
@@ -395,6 +396,14 @@ the import() promise pending indefinitely (standard ESM semantics, subject to
 normal request hang detection). The legacy registry instead throws an eager
 "Top-level await in module is unsettled." error, a deviation tied to its
 evaluate-within-one-drain model.
+The `workerd` dynamic Worker callback uses the loaded Worker's active
+`IoContext`. It does not use the loader Worker's `IoContext`.
+
+Module evaluation is a singleton operation for each module instance. A dynamic
+import uses the context that starts its evaluation. Concurrent imports share
+the same evaluation promise. If that context ends, its pending I/O does not
+transfer to another context. Modules must not export request-owned I/O objects
+for use by later requests.
 ```
 
 ### `require()` Flow
@@ -435,13 +444,19 @@ CJS code: const foo = require('./bar.js')
 
 ## Evaluation and the Evaluator Pattern
 
-Module evaluation has a key constraint: it must occur **outside** any
-`IoContext`. The `Module::Evaluator` pattern enforces this.
+Module evaluation uses an explicit `PreserveIoContext` policy. Most evaluation
+suppresses the current `IoContext`. Dynamic imports and deferred main-module
+evaluation request `PreserveIoContext::YES`. The request only takes effect when
+the embedder installed a preserving callback. `workerd` installs it only for
+Workers with the `dynamic_worker_async_startup` compatibility flag. For every
+other Worker, dynamic imports suppress the current context like all other
+evaluation.
 
 ### The EvalCallback
 
-Set during registry construction via `Builder::setEvalCallback`. The standard
-implementation (from `worker-modules.h`) creates a `SuppressIoContextScope`:
+Registry construction installs two callbacks. `Builder::setEvalCallback`
+installs the default callback. This callback creates a
+`SuppressIoContextScope`:
 
 ```cpp
 builder.setEvalCallback([](Lock& js, const auto& module, auto v8Module,
@@ -454,13 +469,20 @@ builder.setEvalCallback([](Lock& js, const auto& module, auto v8Module,
 });
 ```
 
+`Builder::setIoContextEvalCallback` installs the preserving callback. This
+callback evaluates the module directly. It uses the current `IoContext` when
+one exists. It does not create a context when none exists. `worker-modules.h`
+installs it only when `dynamic_worker_async_startup` is set.
+
 ### How it flows
 
 1. `module.evaluate(js, v8Module, observer, evaluator)` is called.
 2. For ESM modules (`Flags::EVAL` always set):
    - The `evaluator(js, module, v8Module, observer)` is invoked.
-   - The evaluator calls `ModuleRegistry::evaluateImpl` which invokes the
-     `EvalCallback` (wrapping evaluation in `SuppressIoContextScope`).
+   - The evaluator calls `ModuleRegistry::evaluateImpl` with its IoContext
+     policy.
+   - `PreserveIoContext::YES` selects the preserving callback when available.
+   - All other cases use the default callback and suppress the current context.
    - The `EvalCallback` calls `v8Module->Evaluate()`. V8 evaluates the
      source text directly.
 3. For Synthetic modules (dynamic import and require paths):
@@ -653,6 +675,8 @@ newWorkerModuleRegistry<TypeWrapper>(resolveObserver, maybeSource, flags, bundle
   |-- Create ModuleRegistry::Builder
   |
   |-- Set EvalCallback (SuppressIoContextScope wrapper)
+  |-- Set IoContext EvalCallback (preserves the current context;
+  |                               only with dynamic_worker_async_startup)
   |
   |-- registerBuiltinModules<TypeWrapper>(builder, featureFlags)
   |     |-- Node.js compat modules (internal + external bundles)

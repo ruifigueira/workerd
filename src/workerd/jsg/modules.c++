@@ -315,6 +315,10 @@ kj::Maybe<v8::Local<v8::Promise>> instantiateModule(
     prom = jsg::check(module->Evaluate(context)).As<v8::Promise>();
   }
 
+  if (options == InstantiateModuleOptions::RETURN_EVALUATION_PROMISE) {
+    return prom;
+  }
+
   if (module->IsGraphAsync() && prom->State() == v8::Promise::kPending) {
     // If top level await has been disable, error.
     JSG_REQUIRE(options != InstantiateModuleOptions::NO_TOP_LEVEL_AWAIT, Error,

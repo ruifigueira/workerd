@@ -532,6 +532,7 @@ struct Worker::Impl {
   // The environment blob to pass to handlers.
   kj::Maybe<jsg::Value> env;
   kj::Maybe<jsg::Value> ctxExports;
+  bool moduleEvaluationDeferred = false;
 
   // Note: The default export is given the string name "default", because that's what V8 tells us,
   // and so it's easiest to go with it. I guess that means that you can't actually name an export
@@ -1878,7 +1879,8 @@ Worker::Worker(kj::Own<const Script> scriptParam,
     SpanParent parentSpan,
     LockType lockType,
     kj::Maybe<ValidationErrorReporter&> errorReporter,
-    kj::Maybe<kj::Duration&> startupTime)
+    kj::Maybe<kj::Duration&> startupTime,
+    DeferModuleEvaluation deferModuleEvaluation)
     : script(kj::mv(scriptParam)),
       metrics(kj::mv(metricsParam)),
       impl(kj::heap<Impl>()) {
@@ -1993,6 +1995,11 @@ Worker::Worker(kj::Own<const Script> scriptParam,
 
             compileBindings(lock, script->isolate->getApi(), bindingsScope, ctxExports);
 
+            if (script->isModular()) {
+              impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
+              impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
+            }
+
             // Execute script.
             currentSpan = maybeMakeSpan("lw:top_level_execution"_kjc);
 
@@ -2027,58 +2034,16 @@ Worker::Worker(kj::Own<const Script> scriptParam,
                 lock.runMicrotasks();
               }
               KJ_CASE_ONEOF(mainModule, kj::Path) {
-                KJ_IF_SOME(ns,
-                    tryResolveMainModule(lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
-                  impl->env = lock.v8Ref(bindingsScope.As<v8::Value>());
-                  impl->ctxExports = lock.v8Ref(ctxExports.As<v8::Value>());
-
-                  if (!FeatureFlags::get(js).getDisableImportableEnv()) {
-                    lock.setWorkerExports(lock.v8Ref(ctxExports));
-                  }
-
-                  auto& api = script->isolate->getApi();
-                  auto handlers = api.unwrapExports(lock, ns);
-                  auto entrypointClasses = api.getEntrypointClasses(lock);
-
-                  for (auto& handler: handlers.fields) {
-                    KJ_SWITCH_ONEOF(handler.value) {
-                      KJ_CASE_ONEOF(obj, api::ExportedHandler) {
-                        obj.env = lock.v8Ref(bindingsScope.As<v8::Value>());
-                        // Historically, non-class-based handlers reused the same ctx object for all requests.
-                        // This was an accident, but some Workers depend on it.
-                        // Newer worker with the unique_ctx_per_invocation will allocate a new ctx for every request.
-                        obj.ctx = js.alloc<api::ExecutionContext>(lock, jsg::JsValue(ctxExports));
-
-                        // Python Workers append all durable objects, worker entrypoint and workflow
-                        // entrypoint classes in the pythonEntrypoints named export.
-                        bool isPythonWorker = FeatureFlags::get(js).getPythonWorkers();
-                        if (handler.name == "pythonEntrypoints" && isPythonWorker) {
-                          auto handle = obj.self.getHandle(js);
-                          auto dict = js.toDict(handle);
-                          for (auto& field: dict.fields) {
-                            auto unwrapped = api.unwrapExport(lock, field.value);
-                            KJ_SWITCH_ONEOF(unwrapped) {
-                              KJ_CASE_ONEOF(cls, EntrypointClass) {
-                                processEntrypointClass(
-                                    js, kj::mv(cls), entrypointClasses, kj::mv(field.name));
-                              }
-                              KJ_CASE_ONEOF(obj, api::ExportedHandler) {
-                                KJ_FAIL_ASSERT("Expected EntrypointClass");
-                              }
-                            }
-                          }
-                        } else {
-                          impl->namedHandlers.insert(kj::mv(handler.name), kj::mv(obj));
-                        }
-                      }
-                      KJ_CASE_ONEOF(cls, EntrypointClass) {
-                        processEntrypointClass(
-                            js, kj::mv(cls), entrypointClasses, kj::mv(handler.name));
-                      }
-                    }
-                  }
+                if (deferModuleEvaluation == DeferModuleEvaluation::YES) {
+                  impl->moduleEvaluationDeferred = true;
                 } else {
-                  JSG_FAIL_REQUIRE(TypeError, "Main module name is not present in bundle.");
+                  KJ_IF_SOME(ns,
+                      tryResolveMainModule(
+                          lock, mainModule, *jsContext, *script, limitErrorOrTime)) {
+                    processModuleExports(js, ns);
+                  } else {
+                    JSG_FAIL_REQUIRE(TypeError, "Main module name is not present in bundle.");
+                  }
                 }
               }
             }
@@ -2128,6 +2093,52 @@ Worker::~Worker() noexcept(false) {
   // Defer destruction of our V8 objects, in particular our jsg::Context, which requires some
   // finalization.
   lock->push(kj::mv(impl));
+}
+
+void Worker::processModuleExports(jsg::Lock& js, jsg::JsObject namespaceObject) {
+  auto bindingsScope = KJ_ASSERT_NONNULL(impl->env).getHandle(js);
+  auto ctxExports = KJ_ASSERT_NONNULL(impl->ctxExports).getHandle(js).As<v8::Object>();
+
+  if (!FeatureFlags::get(js).getDisableImportableEnv()) {
+    js.setWorkerExports(js.v8Ref(ctxExports));
+  }
+
+  auto& api = script->isolate->getApi();
+  auto handlers = api.unwrapExports(js, namespaceObject);
+  auto entrypointClasses = api.getEntrypointClasses(js);
+
+  for (auto& handler: handlers.fields) {
+    KJ_SWITCH_ONEOF(handler.value) {
+      KJ_CASE_ONEOF(obj, api::ExportedHandler) {
+        obj.env = js.v8Ref(bindingsScope);
+        // Some Workers depend on non-class handlers reusing the same context object.
+        obj.ctx = js.alloc<api::ExecutionContext>(js, jsg::JsValue(ctxExports));
+
+        // Python Workers expose their classes through a generated named export.
+        bool isPythonWorker = FeatureFlags::get(js).getPythonWorkers();
+        if (handler.name == "pythonEntrypoints" && isPythonWorker) {
+          auto handle = obj.self.getHandle(js);
+          auto dict = js.toDict(handle);
+          for (auto& field: dict.fields) {
+            auto unwrapped = api.unwrapExport(js, field.value);
+            KJ_SWITCH_ONEOF(unwrapped) {
+              KJ_CASE_ONEOF(cls, EntrypointClass) {
+                processEntrypointClass(js, kj::mv(cls), entrypointClasses, kj::mv(field.name));
+              }
+              KJ_CASE_ONEOF(obj, api::ExportedHandler) {
+                KJ_FAIL_ASSERT("Expected EntrypointClass");
+              }
+            }
+          }
+        } else {
+          impl->namedHandlers.insert(kj::mv(handler.name), kj::mv(obj));
+        }
+      }
+      KJ_CASE_ONEOF(cls, EntrypointClass) {
+        processEntrypointClass(js, kj::mv(cls), entrypointClasses, kj::mv(handler.name));
+      }
+    }
+  }
 }
 
 void Worker::processEntrypointClass(jsg::Lock& js,
@@ -2424,6 +2435,55 @@ v8::Local<v8::Context> Worker::Lock::getContext() {
   } else {
     KJ_UNREACHABLE;
   }
+}
+
+jsg::Promise<void> Worker::Lock::evaluateDeferredModule() {
+  KJ_REQUIRE(worker.impl->moduleEvaluationDeferred, "Worker module evaluation was not deferred");
+  KJ_REQUIRE(IoContext::hasCurrent(), "Deferred module evaluation requires an IoContext");
+
+  auto& js = static_cast<jsg::Lock&>(*this);
+  auto& mainModule =
+      KJ_ASSERT_NONNULL(worker.script->impl->unboundScriptOrMainModule.tryGet<kj::Path>());
+
+  auto featureFlags = FeatureFlags::get(js);
+  if (featureFlags.getNodeJsCompatV2() && isNewModuleRegistryEnabled(featureFlags)) {
+    JSG_REQUIRE_NONNULL(js.resolveModule("node:process", jsg::RequireEsm::YES), Error,
+        "Failed to initialize node:process module");
+    JSG_REQUIRE_NONNULL(js.resolveModule("node:buffer", jsg::RequireEsm::YES), Error,
+        "Failed to initialize node:buffer module");
+  }
+  if (featureFlags.getEnableNodejsGlobalTimers()) {
+    JSG_REQUIRE_NONNULL(js.resolveInternalModule("node-internal:internal_timers_global_override"),
+        Error, "Failed to initialize node-internal:internal_timers_global_override module");
+  }
+
+  bool allowEvalDuringStartup = featureFlags.getAllowEvalDuringStartup();
+  bool previousEvalAllowed = js.isEvalAllowed();
+  auto evaluation = [&]() -> jsg::Promise<jsg::Value> {
+    jsg::Lock::AllowEvalScope allowEval(js, allowEvalDuringStartup);
+    auto maybeEvaluation = js.resolveMainModuleAsync(mainModule.toString(false));
+    return kj::mv(JSG_REQUIRE_NONNULL(
+        maybeEvaluation, TypeError, "Main module name is not present in bundle."));
+  }();
+  // The WorkerStub owns the forked startup task, so cancellation of an individual request does not
+  // cancel this chain. If the stub is destroyed, it also destroys this worker and its isolate.
+  js.setAllowEval(allowEvalDuringStartup);
+  auto& context = IoContext::current();
+  return kj::mv(evaluation)
+      .then(js,
+          context.addFunctor(
+              [previousEvalAllowed](jsg::Lock& js, IoContext& context, jsg::Value namespaceValue) {
+    js.setAllowEval(previousEvalAllowed);
+    auto& worker = const_cast<Worker&>(context.getWorker());
+    worker.processModuleExports(js, jsg::JsObject(namespaceValue.getHandle(js).As<v8::Object>()));
+    worker.impl->moduleEvaluationDeferred = false;
+  }))
+      .catch_(js,
+          context.addFunctor(
+              [previousEvalAllowed](jsg::Lock& js, IoContext&, jsg::Value exception) {
+    js.setAllowEval(previousEvalAllowed);
+    js.throwException(kj::mv(exception));
+  }));
 }
 
 template <typename T>

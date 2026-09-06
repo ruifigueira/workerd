@@ -203,6 +203,10 @@ await rejects(import('file:///outside'), {
 
 await import('file:///bundle/outside');
 
+await rejects(import('global-top-level-io'), {
+  message: /^Disallowed operation called within global scope/,
+});
+
 const abc123 = await import('abc123');
 strictEqual(abc123.default, 1);
 
@@ -281,8 +285,6 @@ throws(() => myRequire('tla'), {
   message: /^Top-level await is not supported/,
 });
 
-// Verify that a module is unable to perform IO operations at the top level, even if
-// the dynamic import is initiated within the scope of an active IoContext.
 export const nestedRequireDoesNotCrashSiblingTlaModule = {
   async test() {
     // Before the evaluation-depth scope covered the eval callback, this aborted the process.
@@ -291,9 +293,11 @@ export const nestedRequireDoesNotCrashSiblingTlaModule = {
   },
 };
 
-export const noTopLevelIo = {
+// Without dynamic_worker_async_startup, a dynamically imported module evaluates
+// outside the request's IoContext even when the import() runs inside a handler.
+export const noTopLevelIoInDynamicImport = {
   async test() {
-    await rejects(import('bad'), {
+    await rejects(import('top-level-io'), {
       message: /^Disallowed operation called within global scope/,
     });
   },
@@ -717,7 +721,8 @@ export const processRedirectIgnoresQueryAndFragment = {
 //   * [x] JSON
 //   * [x] WASM
 //   * [x] Python (works, but still needs to be fully tested)
-// * [x] IO is forbidden in top-level module scope
+// * [x] Top-level I/O is forbidden in module scope, including in dynamic imports,
+//       unless dynamic_worker_async_startup is set
 // * [x] Async local storage context is propagated into dynamic imports
 // * [x] Static import correctly handles node: modules with/without the node: prefix
 // * [x] Dynamic import correctly handles node: modules with/without the node: prefix

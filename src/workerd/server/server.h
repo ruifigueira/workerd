@@ -334,7 +334,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   kj::Promise<kj::Own<WorkerService>> makeWorkerImpl(kj::StringPtr name,
       WorkerDef def,
       capnp::List<config::Extension>::Reader extensions,
-      ErrorReporter& errorReporter);
+      ErrorReporter& errorReporter,
+      kj::Maybe<kj::Rc<IoChannelFactory>> startupIoChannels = kj::none);
 
   kj::Promise<void> startServices(jsg::V8System& v8System,
       config::Config::Reader config,

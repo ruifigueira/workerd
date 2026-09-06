@@ -22,9 +22,12 @@ const unitTests :Workerd.Config = (
           (name = "tla-pump", commonJsModule = "require('tla-trivial'); exports.ok = true;"),
           (name = "tla-trivial", commonJsModule = "exports.ok = true;"),
 
-          # Intentionally bad module to test error handling.
-          # Evaluation will error because i/o is not permitted at top-level scope.
-          (name = "bad", esModule = "export default 1; setTimeout(() => {}, 10)"),
+          # Without dynamic_worker_async_startup, a dynamic import evaluates outside the
+          # request's IoContext, so top-level I/O fails even from a handler.
+          (name = "top-level-io", esModule = "await fetch('data:text/plain,fetched'); export default 1;"),
+
+          # Dynamic imports do not create an IoContext during ordinary global startup.
+          (name = "global-top-level-io", esModule = "setTimeout(() => {}, 10)"),
 
           # Ensure that async context is propagated into a dynamic import.
           (name = "als", esModule = "export default globalThis.als.getStore()"),

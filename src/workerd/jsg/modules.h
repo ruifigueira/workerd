@@ -36,6 +36,9 @@ enum class InstantiateModuleOptions {
   // kEvaluating, and with no active IoContext the requested module is instantiated
   // synchronously right there, so it cannot settle until we unwind to depth 0.
   ALLOW_PENDING_EVALUATION,
+  // Returns the evaluation promise without draining the microtask queue. The caller must arrange
+  // to await it while the intended execution context remains active.
+  RETURN_EVALUATION_PROMISE,
 };
 
 // Returns the still-pending evaluation promise when called with DYNAMIC_IMPORT from inside

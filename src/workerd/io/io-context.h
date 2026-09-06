@@ -53,6 +53,13 @@ constexpr uint MAX_BLOCK_CONCURRENCY_WHILE_DEPTH = 64;
 // This wishes it were IoContext::Runnable::Exceptional.
 WD_STRONG_BOOL(IoContext_Runnable_Exceptional);
 
+// Whether promises created while an IoContext is current are tagged as belonging to it. Tagged
+// promises settle through the owning context so that continuations run there; see the
+// `handle_cross_request_promise_resolution` compatibility flag. A context that evaluates
+// module-scope code disables tagging: module-scope promises belong to no request and must stay
+// usable after the evaluating context ends, as they are when no IoContext evaluates them.
+WD_STRONG_BOOL(IoContext_TagPromises);
+
 [[noreturn]] void throwExceededMemoryLimit(bool isActor);
 
 class IoContext;
@@ -276,11 +283,14 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
  public:
   class TimeoutManagerImpl;
 
+  using TagPromises = IoContext_TagPromises;
+
   // Construct a new IoContext. Before using it, you must also create an IncomingRequest.
   IoContext(ThreadContext& thread,
       kj::Own<const Worker> worker,
       kj::Maybe<Worker::Actor&> actor,
-      kj::Own<LimitEnforcer> limitEnforcer);
+      kj::Own<LimitEnforcer> limitEnforcer,
+      TagPromises tagPromises = TagPromises::YES);
 
   // On destruction, all outstanding tasks associated with this request are canceled.
   ~IoContext() noexcept(false);
@@ -1257,6 +1267,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   void requireCurrent();
   void checkFarGet(const DeleteQueue& expectedQueue, const std::type_info& type);
 
+  const TagPromises tagPromises;
   kj::Maybe<jsg::JsRef<jsg::JsObject>> promiseContextTag;
   kj::Maybe<jsg::JsRef<jsg::JsObject>> entrypointHandler;
 

@@ -3299,6 +3299,10 @@ class Lock {
   kj::Maybe<JsObject> resolveModule(
       kj::StringPtr specifier, RequireEsm requireEsm = RequireEsm::NO);
 
+  // Resolve and asynchronously evaluate a worker's main ES module. The evaluation starts in the
+  // caller's active execution context and the promise fulfills with the module namespace.
+  kj::Maybe<Promise<Value>> resolveMainModuleAsync(kj::StringPtr specifier);
+
   // Returns the capnp::SchemaLoader for this isolate/context
   template <typename T>
   const capnp::SchemaLoader& getCapnpSchemaLoader() const {

@@ -110,6 +110,24 @@ static kj::Arc<jsg::modules::ModuleRegistry> newWorkerModuleRegistry(
       return js.rejectedJsPromise(jsg::JsValue(exception.getHandle(js)));
     }
   });
+  // Dynamic Workers that defer startup evaluate their main module inside an IoContext, and
+  // their runtime dynamic imports keep the request's IoContext too. Without the flag there
+  // is no preserving callback, so every evaluation suppresses the current IoContext.
+  if (featureFlags.getDynamicWorkerAsyncStartup()) {
+    builder.setIoContextEvalCallback([](jsg::Lock& js, const auto& module, auto v8Module,
+                                         const auto& observer) -> jsg::JsPromise {
+      // Evaluate with the current IoContext when there is one. Without one, this
+      // remains ordinary global-scope evaluation where I/O is unavailable.
+      JSG_TRY(js) {
+        auto ret = jsg::check(v8Module->Evaluate(js.v8Context()));
+        KJ_ASSERT(ret->IsPromise());
+        return jsg::JsPromise(ret.template As<v8::Promise>());
+      }
+      JSG_CATCH(exception) {
+        return js.rejectedJsPromise(jsg::JsValue(exception.getHandle(js)));
+      }
+    });
+  }
 
   // Add the module bundles that are built into the runtime.
   api::registerBuiltinModules<TypeWrapper>(builder, featureFlags, nodeModuleSource);

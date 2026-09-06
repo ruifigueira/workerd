@@ -42,6 +42,7 @@ namespace workerd {
 
 WD_STRONG_BOOL(StructuredLogging);
 WD_STRONG_BOOL(ProcessStdioPrefixed);
+WD_STRONG_BOOL(DeferModuleEvaluation);
 
 namespace api {
 class DurableObjectState;
@@ -159,7 +160,8 @@ class Worker: public kj::AtomicRefcounted {
       SpanParent parentSpan,
       LockType lockType,
       kj::Maybe<ValidationErrorReporter&> errorReporter = kj::none,
-      kj::Maybe<kj::Duration&> startupTime = kj::none);
+      kj::Maybe<kj::Duration&> startupTime = kj::none,
+      DeferModuleEvaluation deferModuleEvaluation = DeferModuleEvaluation::NO);
   // `compileBindings()` is a callback that constructs all of the bindings and adds them as
   // properties to `target`. It also compiles the `ctx.exports` object and writes it to
   // `ctxExports`. Note that it is permissible for this callback to save a handle to `ctxExports`
@@ -239,6 +241,7 @@ class Worker: public kj::AtomicRefcounted {
       EntrypointClass cls,
       EntrypointClasses entrypointClasses,
       kj::String handlerName);
+  void processModuleExports(jsg::Lock& js, jsg::JsObject namespaceObject);
 };
 
 // A compiled script within an Isolate, but which hasn't been instantiated into a particular
@@ -755,6 +758,10 @@ class Worker::Lock {
   // Checks for problems with the registered event handlers (such as that there are none) and
   // reports them to the error reporter.
   void validateHandlers(ValidationErrorReporter& errorReporter);
+
+  // Evaluates a modular worker whose constructor deferred main-module evaluation. The caller must
+  // run this inside the worker's active IoContext.
+  jsg::Promise<void> evaluateDeferredModule();
 
   // Get the ExportedHandler exported under the given name. `entrypointName` may be null to get the
   // default handler. Returns null if this is not a modules-syntax worker (but `entrypointName`

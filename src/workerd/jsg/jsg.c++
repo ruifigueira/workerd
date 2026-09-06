@@ -465,6 +465,29 @@ kj::Maybe<JsObject> Lock::resolveModule(kj::StringPtr specifier, RequireEsm requ
   return JsObject(module->GetModuleNamespace().As<v8::Object>());
 }
 
+kj::Maybe<Promise<Value>> Lock::resolveMainModuleAsync(kj::StringPtr specifier) {
+  auto& isolate = IsolateBase::from(v8Isolate);
+  if (isolate.isUsingNewModuleRegistry()) {
+    return jsg::modules::ModuleRegistry::tryResolveMainModuleAsync(*this, specifier);
+  }
+
+  auto moduleRegistry = jsg::ModuleRegistry::from(*this);
+  if (moduleRegistry == nullptr) return kj::none;
+  auto spec = kj::Path::parse(specifier);
+  auto& info = JSG_REQUIRE_NONNULL(
+      moduleRegistry->resolve(*this, spec), Error, kj::str("No such module: ", specifier));
+  JSG_REQUIRE(info.maybeSynthetic == kj::none, TypeError, "Main module must be an ES module.");
+  auto module = info.module.getHandle(*this);
+  KJ_IF_SOME(evaluation,
+      jsg::instantiateModule(*this, module, InstantiateModuleOptions::RETURN_EVALUATION_PROMISE)) {
+    return toPromise(evaluation)
+        .then(*this, [module = v8Ref(module)](Lock& js, Value) mutable -> Value {
+      return js.v8Ref(module.getHandle(js)->GetModuleNamespace());
+    });
+  }
+  return resolvedPromise(v8Ref(module->GetModuleNamespace()));
+}
+
 void ExternalMemoryTarget::maybeDeferAdjustment(ssize_t amount) const {
   // Carefully check whether `isolate` is locked by the current thread. Note that there's a
   // possibility that the isolate is being torn down in a different thread, which means we cannot

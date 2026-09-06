@@ -786,8 +786,8 @@ class IsolateModuleRegistry final {
           return js.rejectedPromise<Value>(v8Module->GetException());
         }
 
-        auto evaluatePromise =
-            evaluate(js, v8Module, moduleDef, getObserver(), inner.getEvaluator());
+        auto evaluatePromise = evaluate(
+            js, v8Module, moduleDef, getObserver(), inner.getEvaluator(PreserveIoContext::YES));
         auto isWasm = moduleDef.isWasm();
 
         if (!sourcePhase) {
@@ -871,6 +871,43 @@ class IsolateModuleRegistry final {
     }, [&](Value exception) -> Promise<Value> {
       return js.rejectedPromise<Value>(kj::mv(exception));
     }));
+  }
+
+  kj::Maybe<Promise<Value>> resolveMainModuleAsync(Lock& js, const ResolveContext& context) {
+    auto evaluate = [&](Entry& found) -> Promise<Value> {
+      // Evaluation may rehash the lookup table, so do not retain Entry& across this call.
+      auto module = found.key.getHandle(js);
+      auto& moduleDef = found.module;
+      JSG_REQUIRE(moduleDef.isEsm(), TypeError, "Main module must be an ES module.");
+
+      switch (module->GetStatus()) {
+        case v8::Module::kErrored:
+          js.throwException(JsValue(module->GetException()));
+        case v8::Module::kEvaluating:
+          JSG_FAIL_REQUIRE(
+              Error, "Circular dependency when resolving module: ", context.normalizedSpecifier);
+        case v8::Module::kEvaluated:
+          return js.resolvedPromise(js.v8Ref(module->GetModuleNamespace()));
+        default:
+          break;
+      }
+
+      auto evaluation = check(
+          moduleDef.evaluate(js, module, getObserver(), inner.getEvaluator(PreserveIoContext::YES)))
+                            .As<v8::Promise>();
+      return js.toPromise(evaluation)
+          .then(js, [module = js.v8Ref(module)](Lock& js, Value) mutable -> Value {
+        return js.v8Ref(module.getHandle(js)->GetModuleNamespace());
+      });
+    };
+
+    KJ_IF_SOME(found, findResolved(context)) {
+      return evaluate(found);
+    }
+    KJ_IF_SOME(found, resolveWithCaching(js, context)) {
+      return evaluate(found);
+    }
+    return kj::none;
   }
 
   enum class RequireOption {
@@ -2190,6 +2227,11 @@ ModuleRegistry::Builder& ModuleRegistry::Builder::setEvalCallback(EvalCallback c
   return *this;
 }
 
+ModuleRegistry::Builder& ModuleRegistry::Builder::setIoContextEvalCallback(EvalCallback callback) {
+  maybeIoContextEvalCallback = kj::mv(callback);
+  return *this;
+}
+
 kj::Arc<ModuleRegistry> ModuleRegistry::Builder::finish() {
   return kj::arc<ModuleRegistry>(this);
 }
@@ -2198,12 +2240,19 @@ ModuleRegistry::ModuleRegistry(ModuleRegistry::Builder* builder)
     : bundleBase(builder->bundleBase.clone()),
       impl(Impl(builder->bundles_.asPtr())),
       maybeEvalCallback(kj::mv(builder->maybeEvalCallback)),
+      maybeIoContextEvalCallback(kj::mv(builder->maybeIoContextEvalCallback)),
       schemaLoader(kj::mv(builder->schemaLoader)) {}
 
 kj::Maybe<jsg::JsPromise> ModuleRegistry::evaluateImpl(jsg::Lock& js,
     const Module& module,
     v8::Local<v8::Module> v8Module,
-    const CompilationObserver& observer) const {
+    const CompilationObserver& observer,
+    PreserveIoContext preserveIoContext) const {
+  if (preserveIoContext == PreserveIoContext::YES) {
+    KJ_IF_SOME(callback, maybeIoContextEvalCallback) {
+      return callback(js, module, v8Module, observer);
+    }
+  }
   KJ_IF_SOME(callback, maybeEvalCallback) {
     return callback(js, module, v8Module, observer);
   }
@@ -2392,6 +2441,27 @@ kj::Maybe<JsValue> ModuleRegistry::tryResolveModuleNamespace(Lock& js,
   return JsValue(check(ns));
 }
 
+kj::Maybe<Promise<Value>> ModuleRegistry::tryResolveMainModuleAsync(
+    Lock& js, kj::StringPtr specifier) {
+  auto& bound = IsolateModuleRegistry::from(js.v8Isolate);
+  const auto& base = bound.getBundleBase();
+  Url url = ([&]() -> Url {
+    KJ_IF_SOME(resolved, base.tryResolve(specifier)) {
+      return kj::mv(resolved);
+    }
+    js.throwException(js.typeError(kj::str("Invalid module specifier: "_kj, specifier)));
+  })();
+  auto normalized = url.clone(Url::EquivalenceOption::NORMALIZE_PATH);
+  ResolveContext context{
+    .type = ResolveContext::Type::BUNDLE,
+    .source = ResolveContext::Source::INTERNAL,
+    .normalizedSpecifier = normalized,
+    .referrerNormalizedSpecifier = base,
+    .rawSpecifier = specifier,
+  };
+  return bound.resolveMainModuleAsync(js, context);
+}
+
 JsValue ModuleRegistry::resolve(Lock& js,
     kj::StringPtr specifier,
     kj::StringPtr exportName,
@@ -2417,7 +2487,7 @@ kj::Maybe<jsg::JsPromise> Module::Evaluator::operator()(jsg::Lock& js,
     const Module& module,
     v8::Local<v8::Module> v8Module,
     const CompilationObserver& observer) const {
-  return registry.evaluateImpl(js, module, v8Module, observer);
+  return registry.evaluateImpl(js, module, v8Module, observer, preserveIoContext);
 }
 
 bool Module::instantiate(
