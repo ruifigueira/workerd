@@ -2486,6 +2486,16 @@ jsg::Promise<void> Worker::Lock::evaluateDeferredModule() {
   }));
 }
 
+jsg::modules::MainModulePreparationResult Worker::Lock::prepareDeferredModule() {
+  KJ_REQUIRE(worker.impl->moduleEvaluationDeferred, "Worker module evaluation was not deferred");
+  KJ_REQUIRE(IoContext::hasCurrent(), "Deferred module preparation requires an IoContext");
+
+  auto& js = static_cast<jsg::Lock&>(*this);
+  auto& mainModule =
+      KJ_ASSERT_NONNULL(worker.script->impl->unboundScriptOrMainModule.tryGet<kj::Path>());
+  return jsg::modules::ModuleRegistry::tryPrepareMainModule(js, mainModule.toString(false));
+}
+
 template <typename T>
 static inline kj::Own<T> fakeOwn(T& ref) {
   return kj::Own<T>(&ref, kj::NullDisposer::instance);

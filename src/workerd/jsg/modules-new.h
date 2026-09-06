@@ -202,6 +202,11 @@ struct ResolveContext final {
   // The fully resolved absolute import specifier URL for the module being resolved.
   const Url& normalizedSpecifier;
 
+  // The full normalized specifier. Fallback lookups use this URL when
+  // normalizedSpecifier omits its query or fragment. Only set by registries with
+  // ModuleRegistry::Builder::Options::CANONICAL_FALLBACK_URLS.
+  kj::Maybe<const Url&> fallbackSpecifier = kj::none;
+
   // The normalized specifier of the module that is importing this module.
   const Url& referrerNormalizedSpecifier;
 
@@ -222,6 +227,18 @@ struct ResolveContext final {
   // The value is also forwarded to the module fallback service (when
   // configured) as the "type" attribute of the V2 protocol.
   kj::Maybe<kj::StringPtr> importType = kj::none;
+};
+
+struct OwnedResolveContext final {
+  ResolveContext::Type type;
+  ResolveContext::Source source;
+  Url normalizedSpecifier;
+  Url referrerNormalizedSpecifier;
+  kj::Maybe<kj::String> rawSpecifier;
+  kj::Maybe<kj::String> importType;
+
+  explicit OwnedResolveContext(const ResolveContext& context);
+  ResolveContext asResolveContext() const KJ_LIFETIMEBOUND;
 };
 
 class ModuleRegistry;
@@ -276,6 +293,8 @@ class Module {
     EVAL = 1 << 2,
     // A Module with the WASM flag set is a WebAssembly module.
     WASM = 1 << 3,
+    // A Module with the NO_REQUIRE flag set cannot be loaded through require().
+    NO_REQUIRE = 1 << 4,
   };
 
   // The Evaluator controls whether embedder-managed module evaluation preserves
@@ -322,6 +341,8 @@ class Module {
 
   // If isWasm() returns true, then the module is a WebAssembly module.
   bool isWasm() const;
+
+  bool supportsRequire() const;
 
   // Returns the content type of the module.
   inline ContentType contentType() const {
@@ -453,13 +474,8 @@ class Module {
         auto& wrapper = TypeWrapper::from(js.v8Isolate);
         auto ext = js.alloc<T>(js, id);
         ns.setDefault(js, ext->getExports(js));
-        // The module's canonical URL is used as the compiled script's origin name.
-        // V8 reports the origin name as the referrer for dynamic import() performed
-        // by the script, and dynamicImportModuleCallback() identifies the referring
-        // module in the registry's lookup cache by that URL — a non-URL origin
-        // would make dynamic import from this module unable to resolve anything.
-        // This also keeps CJS stack-trace filenames consistent with ESM modules,
-        // whose origins are always their canonical URLs.
+        // The canonical URL lets relative dynamic imports and CJS stack traces use
+        // the same URL as ESM modules.
         auto href = kj::str(id.getHref());
         auto fn = Module::compileEvalFunction(js, source, href,
             JsObject(wrapper.wrap(js, js.v8Context(), kj::none, ext.addRef())), observer);
@@ -518,9 +534,12 @@ constexpr Module::Flags operator|(const Module::Flags& a, const Module::Flags& b
 // Importantly, a ModuleBundle is immutable once created with exception to
 // any internal caching it may use to optimize resolution. Accesses to the
 // bundle must be thread-safe.
+WD_STRONG_BOOL(SupportsRequire);
+
 class ModuleBundle {
  public:
   using Type = Module::Type;
+  using Resolution = kj::OneOf<kj::String, kj::Own<Module>>;
 
   // A Builder is used to construct a ModuleBundle.
   class Builder {
@@ -532,8 +551,7 @@ class ModuleBundle {
     // the new specifier. If the callback returns a Module, then that module
     // will be used as the resolved module. If the callback returns kj::none,
     // then the module is not resolved.
-    using ResolveCallback =
-        kj::Function<kj::Maybe<kj::OneOf<kj::String, kj::Own<Module>>>(const ResolveContext&)>;
+    using ResolveCallback = kj::Function<kj::Maybe<Resolution>(const ResolveContext&)>;
 
     Builder& add(const Url& id, ResolveCallback callback) KJ_LIFETIMEBOUND;
 
@@ -630,8 +648,9 @@ class ModuleBundle {
     }
   };
 
-  static kj::Own<ModuleBundle> newFallbackBundle(
-      Builder::ResolveCallback callback) KJ_WARN_UNUSED_RESULT;
+  static kj::Own<ModuleBundle> newFallbackBundle(Builder::ResolveCallback callback,
+      SupportsRequire supportsRequire = SupportsRequire::YES) KJ_WARN_UNUSED_RESULT;
+  static kj::Own<ModuleBundle> newAsyncFallbackBundle() KJ_WARN_UNUSED_RESULT;
 
   static void getBuiltInBundleFromCapnp(BuiltinBuilder& builder, Bundle::Reader bundle);
 
@@ -669,6 +688,13 @@ class ModuleBundle {
   virtual kj::Maybe<Resolved> lookup(
       const ResolveContext& context) KJ_LIFETIMEBOUND KJ_WARN_UNUSED_RESULT = 0;
 
+  virtual bool acceptsAsyncResolutions() const {
+    return false;
+  }
+  virtual void storeAsyncResolution(const ResolveContext& context, Resolution resolution) {
+    KJ_UNREACHABLE;
+  }
+
  protected:
   ModuleBundle(Type type);
 
@@ -688,6 +714,17 @@ class ModuleBundle {
 // module namespace. Matches Node.js require() semantics.
 WD_STRONG_BOOL(UnwrapDefault);
 
+enum class MainModulePreparationResult {
+  READY,
+  NOT_FOUND,
+  FAILED,
+};
+
+struct AsyncResolveResult final {
+  OwnedResolveContext context;
+  ModuleBundle::Resolution resolution;
+};
+
 class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBase {
  private:
   enum BundleIndices { kBundle, kBuiltin, kBuiltinOnly, kFallback, kBundleCount };
@@ -698,6 +735,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   // Modules with Flag::EVAL defer their evaluation to the selected callback.
   using EvalCallback = Function<jsg::JsPromise(
       const Module& module, v8::Local<v8::Module> v8Module, const CompilationObserver& observer)>;
+  using AsyncResolveCallback = Function<Promise<AsyncResolveResult>(OwnedResolveContext)>;
 
   class Builder final {
    public:
@@ -709,6 +747,15 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
       // ResolveContext::Type::BUNDLE context and is always the last bundle
       // checked. The fallback service should only be used for local dev.
       ALLOW_FALLBACK = 1 << 0,
+      // When set together with ALLOW_FALLBACK, fallback modules are addressed by
+      // their canonical URL: fallback bundles receive the full normalized specifier
+      // including any query string and fragment, static imports resolve relative
+      // to the referring module's canonical URL, and a redirected fallback module
+      // reports the redirect target as import.meta.url. Without this option the
+      // fallback protocol keeps its original behavior: bundles receive the
+      // specifier with query and fragment stripped, and a redirected module keeps
+      // the import specifier as its URL. Requires ALLOW_FALLBACK.
+      CANONICAL_FALLBACK_URLS = 1 << 1,
     };
     Builder(const jsg::Url& bundleBase, Options options = Options::NONE);
     KJ_DISALLOW_COPY_AND_MOVE(Builder);
@@ -719,6 +766,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
 
     Builder& setEvalCallback(EvalCallback callback) KJ_LIFETIMEBOUND;
     Builder& setIoContextEvalCallback(EvalCallback callback) KJ_LIFETIMEBOUND;
+    Builder& setAsyncResolveCallback(AsyncResolveCallback callback) KJ_LIFETIMEBOUND;
 
     capnp::SchemaLoader& getSchemaLoader() {
       return *schemaLoader;
@@ -726,6 +774,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
 
    private:
     bool allowsFallback() const;
+    bool usesCanonicalFallbackUrls() const;
 
     // One slot for each of ModuleBundle::Type
     const jsg::Url& bundleBase;
@@ -733,11 +782,19 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
     kj::FixedArray<kj::Vector<kj::Own<ModuleBundle>>, ModuleRegistry::kBundleCount> bundles_;
     kj::Maybe<EvalCallback> maybeEvalCallback = kj::none;
     kj::Maybe<EvalCallback> maybeIoContextEvalCallback = kj::none;
+    kj::Maybe<AsyncResolveCallback> maybeAsyncResolveCallback = kj::none;
     kj::Own<capnp::SchemaLoader> schemaLoader;
     friend class ModuleRegistry;
   };
 
   kj::Maybe<const Module&> lookup(const ResolveContext& context,
+      const ResolveObserver& observer) const KJ_LIFETIMEBOUND KJ_WARN_UNUSED_RESULT;
+
+  struct LookupResult {
+    kj::Maybe<const Module&> module;
+    kj::Maybe<Url> unresolvedSpecifier;
+  };
+  LookupResult lookupWithUnresolved(const ResolveContext& context,
       const ResolveObserver& observer) const KJ_LIFETIMEBOUND KJ_WARN_UNUSED_RESULT;
 
   // Attaches the ModuleRegistry to the given isolate by creating an IsolateModuleRegistry
@@ -773,6 +830,17 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
 
   static kj::Maybe<Promise<Value>> tryResolveMainModuleAsync(Lock& js, kj::StringPtr specifier);
 
+  // Resolves and instantiates the main module without evaluating it. A failed instantiation leaves
+  // the JavaScript exception pending so the caller can either propagate it or retry after
+  // satisfying a deferred module fallback request.
+  static MainModulePreparationResult tryPrepareMainModule(
+      Lock& js, kj::StringPtr specifier) KJ_WARN_UNUSED_RESULT;
+
+  kj::Maybe<Promise<AsyncResolveResult>> resolveAsync(
+      Lock& js, OwnedResolveContext context) const KJ_WARN_UNUSED_RESULT;
+  void storeAsyncResolution(
+      const ResolveContext& context, ModuleBundle::Resolution resolution) const;
+
   // The constructor is public because kj::heap requires is to be. Do not
   // use the constructor directly. Use the ModuleRegistry::Builder
   ModuleRegistry(ModuleRegistry::Builder* builder);
@@ -791,6 +859,11 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
     return Module::Evaluator(*this, preserveIoContext);
   }
 
+  // See Builder::Options::CANONICAL_FALLBACK_URLS.
+  bool usesCanonicalFallbackUrls() const {
+    return canonicalFallbackUrls;
+  }
+
  private:
   struct Impl {
     // One slot for each of ModuleBundle::Type, within each slot is
@@ -800,6 +873,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   };
 
   jsg::Url bundleBase;
+  const bool canonicalFallbackUrls;
   kj::MutexGuarded<Impl> impl;
   // Marked mutable because kj::Function::operator() is non-const, but the eval
   // callback is conceptually const. Note that a shared registry serves multiple
@@ -809,6 +883,7 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   // nothing).
   mutable kj::Maybe<EvalCallback> maybeEvalCallback = kj::none;
   mutable kj::Maybe<EvalCallback> maybeIoContextEvalCallback = kj::none;
+  mutable kj::Maybe<AsyncResolveCallback> maybeAsyncResolveCallback = kj::none;
   kj::Own<capnp::SchemaLoader> schemaLoader;
 
   struct ModuleRef {
@@ -823,7 +898,8 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   // in `seen` is a cycle and resolves to kj::none.
   kj::Maybe<const Module&> lookupImpl(Impl& impl,
       const ResolveContext& context,
-      kj::Vector<Url>& seen) const KJ_LIFETIMEBOUND KJ_WARN_UNUSED_RESULT;
+      kj::Vector<Url>& seen,
+      kj::Maybe<Url>& unresolvedSpecifier) const KJ_LIFETIMEBOUND KJ_WARN_UNUSED_RESULT;
 
   kj::Maybe<ModuleOrRedirect> tryFindInBundleGroup(const ResolveContext& context,
       kj::ArrayPtr<kj::Own<ModuleBundle>> bundles) const KJ_LIFETIMEBOUND KJ_WARN_UNUSED_RESULT;

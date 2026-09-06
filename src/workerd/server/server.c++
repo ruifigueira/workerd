@@ -5067,6 +5067,203 @@ void Server::deleteAllActors(kj::Maybe<const kj::Exception&> reason) {
   }
 }
 
+constexpr size_t MAX_DYNAMIC_MODULE_FALLBACK_COUNT = 1024;
+constexpr size_t MAX_DYNAMIC_MODULE_FALLBACK_CODE_SIZE = 64 * 1024 * 1024;
+
+class DynamicModuleFallbackState final: public kj::AtomicRefcounted {
+ public:
+  DynamicModuleFallbackState(size_t initialCodeSize)
+      : state(State{
+          .totalCodeSize = initialCodeSize,
+        }) {}
+  KJ_DISALLOW_COPY_AND_MOVE(DynamicModuleFallbackState);
+
+  using Resolution = kj::OneOf<kj::String, kj::Own<jsg::modules::Module>>;
+
+  struct Request {
+    jsg::modules::ResolveContext::Source source;
+    jsg::Url specifier;
+    jsg::Url referrer;
+    kj::Maybe<kj::String> rawSpecifier;
+    kj::Maybe<kj::String> importType;
+  };
+
+  kj::Maybe<Resolution> tryResolve(const jsg::modules::ResolveContext& context) const {
+    switch (context.source) {
+      case jsg::modules::ResolveContext::Source::DYNAMIC_IMPORT:
+      case jsg::modules::ResolveContext::Source::REQUIRE:
+        return kj::none;
+      case jsg::modules::ResolveContext::Source::STATIC_IMPORT:
+      case jsg::modules::ResolveContext::Source::INTERNAL:
+        break;
+    }
+
+    auto lock = state.lockExclusive();
+    KJ_IF_SOME(ready, lock->ready) {
+      if (ready.specifier == context.normalizedSpecifier) {
+        auto result = kj::mv(ready.result);
+        lock->ready = kj::none;
+        return kj::Maybe<Resolution>(kj::mv(result));
+      }
+    }
+
+    if (lock->pending == kj::none) {
+      lock->pending = Request{
+        .source = context.source,
+        .specifier = context.normalizedSpecifier.clone(),
+        .referrer = context.referrerNormalizedSpecifier.clone(),
+        .rawSpecifier =
+            context.rawSpecifier.map([](kj::StringPtr value) { return kj::str(value); }),
+        .importType = context.importType.map([](kj::StringPtr value) { return kj::str(value); }),
+      };
+    }
+    return kj::none;
+  }
+
+  kj::Maybe<Request> takePendingRequest() const {
+    auto lock = state.lockExclusive();
+    auto result = kj::mv(lock->pending);
+    lock->pending = kj::none;
+    return result;
+  }
+
+  bool hasPendingRequest() const {
+    auto lock = state.lockExclusive();
+    return lock->pending != kj::none;
+  }
+
+  void fulfill(jsg::Url specifier, Resolution result) const {
+    auto lock = state.lockExclusive();
+    KJ_REQUIRE(lock->ready == kj::none, "A dynamic module fallback response is already pending");
+    lock->ready = Ready{
+      .specifier = kj::mv(specifier),
+      .result = kj::mv(result),
+    };
+  }
+
+  void beginRequest() const {
+    auto lock = state.lockExclusive();
+    JSG_REQUIRE(++lock->requestCount <= MAX_DYNAMIC_MODULE_FALLBACK_COUNT, Error,
+        "Dynamic module fallback exceeded the maximum request count.");
+  }
+
+  void accountCodeSize(size_t size) const {
+    auto lock = state.lockExclusive();
+    JSG_REQUIRE(size <= MAX_DYNAMIC_MODULE_FALLBACK_CODE_SIZE - lock->totalCodeSize, Error,
+        "Dynamic module fallback exceeded the maximum total code size.");
+    lock->totalCodeSize += size;
+  }
+
+ private:
+  struct Ready {
+    jsg::Url specifier;
+    Resolution result;
+  };
+
+  struct State {
+    kj::Maybe<Request> pending;
+    kj::Maybe<Ready> ready;
+    size_t totalCodeSize = 0;
+    size_t requestCount = 0;
+  };
+
+  mutable kj::MutexGuarded<State> state;
+};
+
+static kj::StringPtr moduleFallbackMethod(jsg::modules::ResolveContext::Source source) {
+  switch (source) {
+    case jsg::modules::ResolveContext::Source::STATIC_IMPORT:
+    case jsg::modules::ResolveContext::Source::DYNAMIC_IMPORT:
+      return "import"_kj;
+    case jsg::modules::ResolveContext::Source::INTERNAL:
+      return "internal"_kj;
+    case jsg::modules::ResolveContext::Source::REQUIRE:
+      KJ_UNREACHABLE;
+  }
+  KJ_UNREACHABLE;
+}
+
+struct FetchedDynamicModule {
+  DynamicModuleFallbackState::Resolution resolution;
+};
+
+static kj::Promise<kj::String> readDynamicModuleResponse(
+    kj::AsyncInputStream& input, const DynamicModuleFallbackState& state) {
+  auto buffer = kj::heapArray<char>(64 * 1024);
+  kj::Vector<char> result;
+  for (;;) {
+    auto size = co_await input.tryRead(buffer.begin(), 1, buffer.size());
+    if (size == 0) break;
+    state.accountCodeSize(size);
+    result.addAll(buffer.first(size));
+  }
+  result.add('\0');
+  co_return kj::String(result.releaseAsArray());
+}
+
+static kj::Promise<FetchedDynamicModule> fetchDynamicModule(IoContext& context,
+    DynamicModuleFallbackState::Request request,
+    CompatibilityFlags::Reader featureFlags,
+    kj::Arc<DynamicModuleFallbackState> state) {
+  capnp::MallocMessageBuilder requestMessage;
+  auto requestBuilder = requestMessage.initRoot<config::FallbackServiceRequest>();
+  auto specifier = kj::str(request.specifier.getHref());
+  auto referrer = kj::str(request.referrer.getHref());
+  requestBuilder.setType(moduleFallbackMethod(request.source));
+  requestBuilder.setSpecifier(specifier);
+  requestBuilder.setReferrer(referrer);
+  KJ_IF_SOME(rawSpecifier, request.rawSpecifier) {
+    requestBuilder.setRawSpecifier(rawSpecifier);
+  }
+  KJ_IF_SOME(importType, request.importType) {
+    auto attributes = requestBuilder.initAttributes(1);
+    attributes[0].setName("type");
+    attributes[0].setValue(importType);
+  }
+
+  capnp::JsonCodec json;
+  auto payload = json.encode(requestBuilder);
+  auto headers = kj::HttpHeaders(context.getHeaderTable());
+  headers.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::JSON.toString());
+  auto client = context.getHttpClient(
+      IoContext::NULL_CLIENT_CHANNEL, false, kj::none, "dynamic_module_fallback"_kjc);
+  auto httpRequest = client->request(kj::HttpMethod::POST,
+      "https://dynamic-module-fallback.invalid/"_kjc, headers, payload.size());
+  co_await httpRequest.body->write(payload.asBytes());
+  auto response = co_await httpRequest.response;
+
+  if (response.statusCode == 301) {
+    auto location = JSG_REQUIRE_NONNULL(response.headers->get(kj::HttpHeaderId::LOCATION), Error,
+        "Dynamic module fallback returned a redirect without a location.");
+    co_return FetchedDynamicModule{.resolution = kj::str(location)};
+  }
+
+  JSG_REQUIRE(response.statusCode == 200, Error, "Dynamic module fallback failed for ",
+      request.specifier.getHref(), " with status ", response.statusCode, ".");
+  auto responseBody = co_await readDynamicModuleResponse(*response.body, *state);
+
+  capnp::MallocMessageBuilder moduleMessage;
+  auto moduleBuilder = moduleMessage.initRoot<config::Worker::Module>();
+  json.handleByAnnotation<config::Worker::Module>();
+  json.decode(responseBody, moduleBuilder);
+  if (moduleBuilder.hasName()) {
+    JSG_REQUIRE(moduleBuilder.getName() == specifier, TypeError,
+        "Dynamic module fallback returned a module name that does not match the requested "
+        "specifier.");
+  } else {
+    moduleBuilder.setName(specifier);
+  }
+  auto flags = jsg::modules::Module::Flags::NO_REQUIRE;
+  if (request.source == jsg::modules::ResolveContext::Source::INTERNAL) {
+    flags = flags | jsg::modules::Module::Flags::MAIN;
+  }
+  auto maybeModule =
+      WorkerdApi::compileFallbackModule(moduleBuilder.asReader(), featureFlags, flags);
+  auto module = kj::mv(JSG_REQUIRE_NONNULL(
+      maybeModule, TypeError, "Dynamic module fallback returned an unsupported module."));
+  co_return FetchedDynamicModule{.resolution = kj::mv(module)};
+}
+
 // WorkerDef is an intermediate representation of everything from `config::Worker::Reader` that
 // `Server::makeWorkerImpl()` needs. Similar to `WorkerSource`, we factor out this intermediate
 // representation so that we can potentially build it dynamically from input that isn't a
@@ -5075,6 +5272,7 @@ struct Server::WorkerDef {
   CompatibilityFlags::Reader featureFlags;
   WorkerSource source;
   kj::Maybe<kj::StringPtr> moduleFallback;
+  kj::Maybe<kj::Arc<DynamicModuleFallbackState>> dynamicModuleFallback;
   const kj::HashMap<kj::String, ActorConfig>& localActorConfigs;
   bool isDynamic;
 
@@ -5556,6 +5754,11 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       });
 
       bool deferModuleEvaluation = source.compatibilityFlags.getDynamicWorkerAsyncStartup();
+      kj::Maybe<kj::Arc<DynamicModuleFallbackState>> dynamicModuleFallback;
+      if (deferModuleEvaluation && source.compatibilityFlags.getExperimentalAllowEvalAlways() &&
+          isNewModuleRegistryEnabled(source.compatibilityFlags)) {
+        dynamicModuleFallback = kj::arc<DynamicModuleFallbackState>(source.codeSize);
+      }
       auto globalOutbound = kj::mv(source.globalOutbound).orDefault([]() {
         return kj::refcounted<NullGlobalOutboundChannel>();
       });
@@ -5578,6 +5781,7 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
         .featureFlags = source.compatibilityFlags,
         .source = kj::mv(source.source),
         .moduleFallback = kj::none,
+        .dynamicModuleFallback = kj::mv(dynamicModuleFallback),
         .localActorConfigs = EMPTY_ACTOR_CONFIGS,
         .isDynamic = true,
 
@@ -5865,6 +6069,7 @@ kj::Promise<kj::Own<Server::Service>> Server::makeWorker(kj::StringPtr name,
     .featureFlags = featureFlags.asReader(),
     .source = WorkerdApi::extractSource(name, conf, featureFlags.asReader(), errorReporter),
     .moduleFallback = conf.hasModuleFallback() ? kj::some(conf.getModuleFallback()) : kj::none,
+    .dynamicModuleFallback = kj::none,
     .localActorConfigs = localActorConfigs,
     .isDynamic = false,
 
@@ -5972,6 +6177,40 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
     KJ_IF_SOME(moduleFallback, def.moduleFallback) {
       maybeFallbackService = kj::str(moduleFallback);
     }
+    kj::Maybe<WorkerdApi::NewModuleFallbackCallback> dynamicFallback;
+    kj::Maybe<WorkerdApi::NewModuleAsyncFallbackCallback> dynamicAsyncFallback;
+    KJ_IF_SOME(state, def.dynamicModuleFallback) {
+      dynamicFallback = WorkerdApi::NewModuleFallbackCallback(
+          [state = state.addRef()](const jsg::modules::ResolveContext& context) mutable {
+        return state->tryResolve(context);
+      });
+
+      auto featureFlags = capnp::clone(def.featureFlags);
+      dynamicAsyncFallback = WorkerdApi::NewModuleAsyncFallbackCallback(
+          [state = state.addRef(), featureFlags = kj::mv(featureFlags)](
+              jsg::Lock& js, jsg::modules::OwnedResolveContext fallbackContext) {
+        auto request = DynamicModuleFallbackState::Request{
+          .source = fallbackContext.source,
+          .specifier = fallbackContext.normalizedSpecifier.clone(),
+          .referrer = fallbackContext.referrerNormalizedSpecifier.clone(),
+          .rawSpecifier = fallbackContext.rawSpecifier.map(
+              [](const kj::String& value) { return kj::str(value); }),
+          .importType = fallbackContext.importType.map(
+              [](const kj::String& value) { return kj::str(value); }),
+        };
+        auto& context = IoContext::current();
+        state->beginRequest();
+        return context.awaitIo(js,
+            fetchDynamicModule(context, kj::mv(request), *featureFlags, state.addRef()),
+            [fallbackContext = kj::mv(fallbackContext)](
+                jsg::Lock&, FetchedDynamicModule fetched) mutable {
+          return jsg::modules::AsyncResolveResult{
+            .context = kj::mv(fallbackContext),
+            .resolution = kj::mv(fetched.resolution),
+          };
+        });
+      });
+    }
 
     using ArtifactBundler = workerd::api::pyodide::ArtifactBundler;
 
@@ -5979,6 +6218,7 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       newModuleRegistry = WorkerdApi::newWorkerdModuleRegistry(
           def.source.variant.tryGet<Worker::Script::ModulesSource>(), def.featureFlags,
           pythonConfig, bundleBase, extensions, kj::mv(maybeFallbackService),
+          kj::mv(dynamicFallback), kj::mv(dynamicAsyncFallback),
           ArtifactBundler::makeDisabledBundler());
     })) {
       // Building the module registry from the worker's source failed. This is
@@ -5994,8 +6234,8 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
       errorReporter.addError(kj::str(exception.getDescription()));
       def.source = WorkerSource(Worker::Script::ScriptSource{""_kj, name, nullptr});
       newModuleRegistry = WorkerdApi::newWorkerdModuleRegistry(kj::none, def.featureFlags,
-          pythonConfig, bundleBase, capnp::List<config::Extension>::Reader{}, kj::none,
-          ArtifactBundler::makeDisabledBundler());
+          pythonConfig, bundleBase, capnp::List<config::Extension>::Reader{}, kj::none, kj::none,
+          kj::none, ArtifactBundler::makeDisabledBundler());
     }
   }
 
@@ -6103,6 +6343,43 @@ kj::Promise<kj::Own<Server::WorkerService>> Server::makeWorkerImpl(kj::StringPtr
         kj::mv(channels), kj::refcounted<RequestObserver>(), kj::none, kj::none);
     incomingRequest->delivered();
     KJ_DEFER(incomingRequest->drain(tasks, kj::mv(incomingRequest)));
+
+    KJ_IF_SOME(fallback, def.dynamicModuleFallback) {
+      for (;;) {
+        bool ready =
+            co_await context->run([fallback = fallback.addRef()](Worker::Lock& lock) mutable {
+          v8::TryCatch catcher(lock.getIsolate());
+          auto result = lock.prepareDeferredModule();
+          if (result == jsg::modules::MainModulePreparationResult::READY) {
+            return true;
+          }
+          if (fallback->hasPendingRequest()) {
+            catcher.Reset();
+            return false;
+          }
+          if (result == jsg::modules::MainModulePreparationResult::NOT_FOUND) {
+            JSG_FAIL_REQUIRE(TypeError, "Main module name is not present in bundle.");
+          }
+          if (catcher.HasCaught()) {
+            catcher.ReThrow();
+            throw jsg::JsExceptionThrown();
+          }
+          JSG_FAIL_REQUIRE(Error, "Failed to instantiate the dynamic worker module graph.");
+        });
+        if (ready) break;
+
+        auto request = KJ_ASSERT_NONNULL(fallback->takePendingRequest());
+        auto requestedSpecifier = request.specifier.clone();
+        fallback->beginRequest();
+        auto fetched = co_await context->run(
+            [request = kj::mv(request), featureFlags = def.featureFlags,
+                fallback = fallback.addRef()](Worker::Lock&, IoContext& context) mutable {
+          return fetchDynamicModule(context, kj::mv(request), featureFlags, kj::mv(fallback));
+        });
+        fallback->fulfill(kj::mv(requestedSpecifier), kj::mv(fetched.resolution));
+      }
+    }
+
     co_await context->run([](Worker::Lock& lock, IoContext& context) {
       return context.awaitJs(lock, lock.evaluateDeferredModule());
     });

@@ -763,6 +763,9 @@ class Worker::Lock {
   // run this inside the worker's active IoContext.
   jsg::Promise<void> evaluateDeferredModule();
 
+  // Resolves and instantiates a deferred main module without evaluating it.
+  jsg::modules::MainModulePreparationResult prepareDeferredModule() KJ_WARN_UNUSED_RESULT;
+
   // Get the ExportedHandler exported under the given name. `entrypointName` may be null to get the
   // default handler. Returns null if this is not a modules-syntax worker (but `entrypointName`
   // must be null in that case).

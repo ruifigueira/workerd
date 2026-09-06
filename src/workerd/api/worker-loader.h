@@ -100,8 +100,11 @@ class WorkerLoader: public jsg::Object {
     // in the python_modules/ directory. If the content is a `WebAssembly.Module` (e.g. obtained
     // via a source phase import), it becomes a WASM module sharing the already-compiled code.
     // If the content is any other object, the type of module is determined based on which
-    // property is set.
-    jsg::Dict<kj::OneOf<jsg::V8Ref<v8::WasmModuleObject>, Module, kj::String>> modules;
+    // property is set. This may be empty or omitted only when asynchronous startup, unrestricted
+    // eval, and the new module registry are all enabled so that globalOutbound can supply the
+    // startup static-import graph.
+    jsg::Optional<jsg::Dict<kj::OneOf<jsg::V8Ref<v8::WasmModuleObject>, Module, kj::String>>>
+        modules;
 
     // Any RPC-serializable value!
     jsg::Optional<jsg::JsRef<jsg::JsObject>> env;
@@ -130,9 +133,19 @@ class WorkerLoader: public jsg::Object {
         tails,
         streamingTails);
 
-    JSG_STRUCT_TS_OVERRIDE(WorkerLoaderWorkerCode {
-      modules: Record<string, string | WebAssembly.Module | WorkerLoaderModule>;
-    });
+    JSG_STRUCT_TS_OVERRIDE_DYNAMIC(CompatibilityFlags::Reader flags) {
+      // Omitting `modules` requires experimental flags on the loaded worker, which in turn
+      // requires `allowExperimental`, which requires the loader to have the `experimental` flag.
+      if (flags.getWorkerdExperimental()) {
+        JSG_TS_OVERRIDE(WorkerLoaderWorkerCode {
+          modules?: Record<string, string | WebAssembly.Module | WorkerLoaderModule>;
+        });
+      } else {
+        JSG_TS_OVERRIDE(WorkerLoaderWorkerCode {
+          modules: Record<string, string | WebAssembly.Module | WorkerLoaderModule>;
+        });
+      }
+    }
   };
 
   jsg::Ref<WorkerStub> get(
@@ -149,6 +162,11 @@ class WorkerLoader: public jsg::Object {
   }
 
  private:
+  struct ExtractedSource {
+    Worker::Script::Source source;
+    size_t codeSize;
+  };
+
   uint channel;
   CompatibilityDateValidation compatDateValidation;
 
@@ -157,7 +175,8 @@ class WorkerLoader: public jsg::Object {
       CompatibilityDateValidation compatDateValidation,
       WorkerCode code);
 
-  static Worker::Script::Source extractSource(jsg::Lock& js, WorkerCode& code);
+  static ExtractedSource extractSource(
+      jsg::Lock& js, WorkerCode& code, CompatibilityFlags::Reader compatFlags);
   static kj::Own<CompatibilityFlags::Reader> extractCompatFlags(
       jsg::Lock& js, WorkerCode& code, CompatibilityDateValidation compatDateValidation);
 

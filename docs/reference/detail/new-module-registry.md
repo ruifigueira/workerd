@@ -91,7 +91,10 @@ IsolateModuleRegistry
   |     Each Entry:
   |       |-- key: HashableV8Ref<v8::Module>  (V8 module handle)
   |       |-- id: Url                         (specifier incl. query/fragment;
-  |       |                                    this is the instance's import.meta.url)
+  |       |                                    part of the cache key)
+  |       |-- importMetaUrl: Url              (import.meta.url; the redirect target for
+  |       |                                    fallback redirects under
+  |       |                                    CANONICAL_FALLBACK_URLS, else same as id)
   |       +-- module: const Module&           (back-ref to definition)
   |     Indices:
   |       |-- HashIndex<EntryCallbacks>     -- by v8::Module identity
@@ -264,9 +267,23 @@ It returns either a `Module` (resolved), a redirect string, or `kj::none` (not f
 
 ### `FallbackModuleBundle` (file-private)
 
-Used only for local development (`workerd` binary). Contains a single
-`ResolveCallback` that calls an external service. Caches results in internal
-`storage` and `aliases` maps.
+Used only for local development and dynamic Worker loading. A synchronous bundle
+invokes a `ResolveCallback` during lookup. An asynchronous bundle receives
+resolutions from the registry callback after a lookup miss.
+Both forms cache results in internal `storage` and `aliases` maps.
+
+The `SupportsRequire` option controls whether `require()` can use a fallback
+bundle. Dynamic Worker fallback bundles set this option to `NO`. Their modules
+also use `Flags::NO_REQUIRE` to prevent access through the isolate resolution cache.
+
+The registry option `CANONICAL_FALLBACK_URLS` selects how fallback modules are
+addressed. `workerd` sets it only for dynamic Worker registries:
+
+| Behaviour                                   | Without option (static `moduleFallback`) | With option (dynamic Workers) |
+| ------------------------------------------- | ---------------------------------------- | ----------------------------- |
+| Specifier passed to the fallback bundle     | Query and fragment stripped              | Full normalized specifier     |
+| Base URL for static imports from a module   | Import specifier (`Entry.id`)            | Module canonical URL          |
+| `import.meta.url` of a redirected module    | Import specifier                         | Redirect target               |
 
 ### `BundleBuilder` — Building Worker Bundle Modules
 
@@ -327,9 +344,10 @@ User code: import { foo } from './bar.js'
 
 1. V8 calls resolveModuleCallback<false>(context, specifier, attrs, referrer)
 
-2. Look up referrer in IsolateModuleRegistry by v8::Module identity
+2. Look up the referrer in `IsolateModuleRegistry` by `v8::Module` identity.
    -> Determines referrer's type (BUNDLE/BUILTIN/BUILTIN_ONLY)
-   -> Gets referrer's URL for relative resolution
+   -> Gets the referrer URL for relative resolution: the import specifier
+      (`Entry.id`), or the module's canonical URL under CANONICAL_FALLBACK_URLS
 
 3. Normalize specifier:
    a. If Node.js compat enabled, check for bare node specifier -> prefix "node:"
@@ -343,7 +361,9 @@ User code: import { foo } from './bar.js'
    a. findResolved(context): resolutions map hit by (type, URL) ->
       instantiations row by (URL, definition) -> return v8::Module handle
    b. Cache miss -> call resolveWithCaching(js, context)
-      i.   Strip query params and fragments from specifier
+      i.   Strip query params and fragments from the specifier. Under
+           CANONICAL_FALLBACK_URLS the full specifier is also passed as
+           fallbackSpecifier for the fallback bundles.
       ii.  Call inner.lookup(innerContext)  [acquires MutexGuarded exclusive lock]
       iii. ModuleRegistry::lookupImpl searches bundles in priority order
       iv.  Each bundle's lookup() checks aliases, cache, then resolve callbacks
@@ -353,7 +373,7 @@ User code: import { foo } from './bar.js'
       vii. If an instantiation already exists for (URL, definition) — e.g. the
            same builtin resolved through another context type — reuse its
            v8::Module; otherwise call module.getDescriptor(js, observer) and
-           insert a new Entry{v8Module, id, module}
+           insert a new Entry{v8Module, id, importMetaUrl, module}
    c. Return v8::Module handle from the Entry
 
 6. V8 receives the v8::Module and continues PrepareInstantiate
@@ -371,23 +391,25 @@ User code: const mod = await import('./bar.js')
 
 3. Parse referrer from resource_name. Modules created by this registry always
    use their canonical URL as the ScriptOrigin name (including CJS-style eval
-   functions), so this parse succeeds for them. Scripts with non-URL origin
-   names (service-worker mains, eval'd code) fall back to bundleBase, and the
-   referrer lookup below then fails with a clear "Referring module not found"
-   TypeError.
+   functions), so this parse succeeds for them. Scripts with an empty or non-URL
+   origin name (service-worker mains, eval'd code) have no resolution context, so
+   the import() rejects with a "Referring module not found" TypeError.
+   host_options supplies referrerType. ES modules use their Module::Type.
+   Other URL-origin scripts use BUNDLE.
 
 4. Normalize specifier (same as static: node: prefix, process redirect, URL resolve)
 
-5. IsolateModuleRegistry::dynamicResolve(js, normalizedSpec, referrer, rawSpec, sourcePhase)
-   a. Identify the referrer: probe the resolutions map for the referrer URL
-      across context types in resolution-priority order (BUNDLE first). V8
-      supplies only the URL string, and with shadowing one URL can have entries
-      under multiple types, so referrer typing is a policy choice favoring the
-      bundle module.
-   b. Build ResolveContext { type from referrer's module, source=DYNAMIC_IMPORT, ... }
-   c. findResolved or resolveWithCaching (same as static)
-   d. Call module.evaluate() with `PreserveIoContext::YES` -> Promise
-   e. Chain: .then(namespace -> resolve Promise with module namespace)
+5. IsolateModuleRegistry::dynamicResolve(js, normalizedSpec, referrer, referrerType,
+   rawSpec, sourcePhase)
+   a. Build ResolveContext { type=referrerType, source=DYNAMIC_IMPORT, ... }
+   b. findResolved or resolveWithCaching (same as static)
+   c. If the lookup misses, call the optional asynchronous resolver with an
+      owned ResolveContext.
+   d. Store the module or redirect in the asynchronous fallback bundle.
+   e. Retry the original dynamic import. Static dependencies can repeat steps
+      c and d during module instantiation.
+   f. Call module.evaluate() with `PreserveIoContext::YES` -> Promise
+   g. Chain: .then(namespace -> resolve Promise with module namespace)
 
 6. Return Promise to V8
 
@@ -396,6 +418,7 @@ the import() promise pending indefinitely (standard ESM semantics, subject to
 normal request hang detection). The legacy registry instead throws an eager
 "Top-level await in module is unsettled." error, a deviation tied to its
 evaluate-within-one-drain model.
+
 The `workerd` dynamic Worker callback uses the loaded Worker's active
 `IoContext`. It does not use the loader Worker's `IoContext`.
 
@@ -504,7 +527,8 @@ The `importMeta` callback is registered on the isolate during
 1. Looks up the module in the `IsolateModuleRegistry` by v8::Module handle.
 2. Sets three properties via `CreateDataProperty`:
    - `import.meta.main` — `true` if `Module::Flags::MAIN` is set
-   - `import.meta.url` — the module's URL (e.g. `"file:///bundle/index.js"`)
+   - `import.meta.url` — the module's URL (e.g. `"file:///bundle/index.js"`).
+     Under CANONICAL_FALLBACK_URLS, a fallback redirect uses its target URL.
    - `import.meta.resolve(specifier)` — resolves `specifier` relative to
      `import.meta.url` using WHATWG URL resolution (with `node:` bare-specifier
      handling when Node.js compat is enabled). Returns the resolved URL string,
@@ -553,10 +577,8 @@ handler for CommonJS-style modules:
 1. Allocates a JSG resource object of type `T` (e.g. `CommonJsModuleContext`).
 2. Compiles the source as a function via `ScriptCompiler::CompileFunction` with
    the JSG object as extension object (providing `module`, `exports`, `require`).
-   The module's canonical URL is used as the compiled script's origin name: V8
-   reports the origin as the referrer for dynamic `import()` performed by the
-   script, which is how the dynamic import callback identifies the referring
-   module. This also makes CJS stack-trace filenames consistent with ESM ones.
+   The module's canonical URL is used as the compiled script's origin name.
+   Relative dynamic imports and CJS stack traces use the same URL as ESM modules.
 3. Calls the compiled function.
 4. Extracts `exports` from the JSG object and sets them on the module namespace.
 
@@ -613,7 +635,7 @@ diagram above for the identity rules this encodes):
 | Structure        | Shape                                                     | Used by                                        |
 | ---------------- | --------------------------------------------------------- | ---------------------------------------------- |
 | `instantiations` | `kj::Table<Entry>` indexed by v8 handle and by (URL, def) | Reverse lookup (importMeta, resolve callbacks) |
-| `resolutions`    | `HashMap<SpecifierContext, const Module*>`                | Primary resolution and referrer probing        |
+| `resolutions`    | `HashMap<SpecifierContext, const Module*>`                | Primary resolution cache                       |
 
 Lookup properties:
 
@@ -621,14 +643,13 @@ Lookup properties:
   then (URL, definition) → Entry.
 - **Reverse lookup** (v8::Module to Entry) is O(1) hash lookup (vs legacy's O(n)
   linear scan over all entries).
-- **Referrer lookup** probes the resolutions map once per context type in
-  resolution-priority order (at most four O(1) lookups).
-
 ### Cache Population
 
 On first resolution of a specifier:
 
 1. `resolveWithCaching` strips query params and fragments from the specifier.
+   Under CANONICAL_FALLBACK_URLS the fallback bundles receive the full
+   normalized specifier instead.
 2. Calls `inner.lookup()` on the shared `ModuleRegistry` (acquires exclusive lock).
 3. If found, records (type, URL) → definition in `resolutions`.
 4. Reuses the existing instantiation for (URL, definition) if one exists;

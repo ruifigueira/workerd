@@ -6,9 +6,129 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 let outboundRequests = 0;
 let sourceRequests = 0;
+let moduleFallbackRequests = [];
+let activeModuleFallbackRequests = 0;
+let maxActiveModuleFallbackRequests = 0;
 
 export class Outbound extends WorkerEntrypoint {
-  fetch() {
+  async fetch(request) {
+    if (request.method === 'POST') {
+      const resolution = await request.json();
+      moduleFallbackRequests.push(resolution);
+      switch (resolution.specifier) {
+        case 'file:///bundle/main.js':
+          return Response.json({
+            esModule: `
+              import { message } from './message.js';
+              import value from './value.json' with { type: 'json' };
+
+              export default {
+                fetch() {
+                  return new Response(message + ':' + value.answer + ':' + import.meta.main);
+                },
+              };
+            `,
+          });
+        case 'file:///bundle/message.js':
+          return Response.json({
+            esModule: "export const message = 'fallback';",
+          });
+        case 'file:///bundle/remote.js':
+          return Response.json({
+            esModule: "export const remote = 'remote';",
+          });
+        case 'file:///bundle/value.json':
+          return Response.json({ json: '{"answer":42}' });
+        case 'file:///bundle/runtime-redirect.js':
+          return new Response(null, {
+            status: 301,
+            headers: { location: 'file:///canonical/runtime.js' },
+          });
+        case 'file:///canonical/runtime.js':
+          return Response.json({
+            esModule: `
+              import { dependency } from './runtime-dependency.js';
+              export const value = 'runtime:' + dependency;
+              export const moduleUrl = import.meta.url;
+              export const resolvedNested = import.meta.resolve('./runtime-nested.js');
+              export async function loadNested() {
+                return (await import('./runtime-nested.js')).nested;
+              }
+            `,
+          });
+        case 'file:///canonical/runtime-dependency.js':
+          return Response.json({
+            esModule: "export const dependency = 'dependency';",
+          });
+        case 'file:///canonical/runtime-nested.js':
+          return Response.json({
+            esModule: "export const nested = 'nested';",
+          });
+        case 'file:///bundle/runtime-value.json':
+          return Response.json({ json: '{"answer":42}' });
+        case 'file:///bundle/runtime-query.js?version=1':
+          return Response.json({
+            esModule: `
+              export default 'query';
+              export async function loadNestedQuery() {
+                return (await import('./runtime-query-child.js?version=2')).default;
+              }
+            `,
+          });
+        case 'file:///bundle/runtime-query-child.js?version=2':
+          return Response.json({ esModule: "export default 'nested-query';" });
+        case 'file:///bundle/query-identity.js?version=1':
+          return Response.json({
+            esModule:
+              'export const version = 1; export const url = import.meta.url;',
+          });
+        case 'file:///bundle/query-identity.js?version=2':
+          return Response.json({
+            esModule:
+              'export const version = 2; export const url = import.meta.url;',
+          });
+        case 'file:///bundle/queryless-redirect.js?version=1':
+          return new Response(null, {
+            status: 301,
+            headers: { location: 'file:///bundle/queryless-redirect.js' },
+          });
+        case 'file:///bundle/queryless-redirect.js':
+          return Response.json({
+            esModule:
+              "export default 'redirected'; export const url = import.meta.url;",
+          });
+        case 'file:///bundle/redirect-cycle-a.js?version=1':
+          return new Response(null, {
+            status: 301,
+            headers: {
+              location: 'file:///bundle/redirect-cycle-b.js?version=2',
+            },
+          });
+        case 'file:///bundle/redirect-cycle-b.js?version=2':
+          return new Response(null, {
+            status: 301,
+            headers: {
+              location: 'file:///bundle/redirect-cycle-a.js?version=1',
+            },
+          });
+        case 'file:///bundle/concurrent-a.js':
+        case 'file:///bundle/concurrent-b.js': {
+          ++activeModuleFallbackRequests;
+          maxActiveModuleFallbackRequests = Math.max(
+            maxActiveModuleFallbackRequests,
+            activeModuleFallbackRequests
+          );
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          --activeModuleFallbackRequests;
+          return Response.json({
+            esModule: `export default '${resolution.specifier.at(-4)}';`,
+          });
+        }
+        default:
+          return new Response('not found', { status: 404 });
+      }
+    }
+
     ++outboundRequests;
     return new Response('fetched');
   }
@@ -33,6 +153,7 @@ async function testAsyncStartup(env, ctx, name, extraFlags = []) {
       compatibilityDate: '2025-01-01',
       compatibilityFlags: [
         'allow_eval_during_startup',
+        'allow_insecure_inefficient_logged_eval',
         'allow_importable_env',
         'dynamic_worker_async_startup',
         ...extraFlags,
@@ -50,14 +171,17 @@ async function testAsyncStartup(env, ctx, name, extraFlags = []) {
           const returnedService = await env.capabilityFactory.get(null);
           const capabilityResult =
               await (await returnedService.fetch('https://example.com/')).text();
-          const evalResult = eval("'eval'");
+          const startupEvalResult = eval("'startup-eval'");
           const dynamicImportResult = ${dynamicImportSource};
 
           export default {
             fetch() {
+              const runtimeEvalResult = eval("'runtime-eval'");
+              const runtimeFunctionResult = new Function("return 'runtime-function'")();
               return new Response(
                   timerResult + ':' + fetchResult + ':' + capabilityResult + ':' +
-                  evalResult + ':' + dynamicImportResult);
+                  startupEvalResult + ':' + runtimeEvalResult + ':' + runtimeFunctionResult +
+                  ':' + dynamicImportResult);
             },
           };
         `,
@@ -88,7 +212,7 @@ async function testAsyncStartup(env, ctx, name, extraFlags = []) {
   for (const response of responses) {
     assert.strictEqual(
       await response.text(),
-      'timer:fetched:fetched:eval' +
+      'timer:fetched:fetched:startup-eval:runtime-eval:runtime-function' +
         (testDynamicImportIo ? ':fetched:timer:36' : ':not-tested')
     );
   }
@@ -243,10 +367,7 @@ export const asyncStartupRejection = {
     ]) {
       const worker = env.loader.get(name, () => ({
         compatibilityDate: '2025-01-01',
-        compatibilityFlags: [
-          'dynamic_worker_async_startup',
-          ...extraFlags,
-        ],
+        compatibilityFlags: ['dynamic_worker_async_startup', ...extraFlags],
         allowExperimental: true,
         mainModule: 'main.js',
         modules: {
@@ -299,6 +420,39 @@ export const asyncStartupFlagIsExperimental = {
   },
 };
 
+export const startupEvalPermissionEnds = {
+  async test(ctrl, env) {
+    const worker = env.loader.get('startupEvalPermissionEnds', () => ({
+      compatibilityDate: '2025-01-01',
+      compatibilityFlags: [
+        'allow_eval_during_startup',
+        'dynamic_worker_async_startup',
+      ],
+      allowExperimental: true,
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          const startupResult = eval("'startup-eval'");
+
+          export default {
+            fetch() {
+              try {
+                eval("'runtime-eval'");
+                return new Response(startupResult + ':unexpected-success');
+              } catch (error) {
+                return new Response(startupResult + ':' + error.name);
+              }
+            },
+          };
+        `,
+      },
+    }));
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'startup-eval:EvalError');
+  },
+};
+
 export const abortDuringAsyncStartup = {
   async test(ctrl, env) {
     const worker = env.loader.get('abortDuringAsyncStartup', () => ({
@@ -316,5 +470,321 @@ export const abortDuringAsyncStartup = {
     }));
 
     await assert.rejects(worker.getEntrypoint().fetch('https://example.com/'));
+  },
+};
+
+export const asyncStartupModuleFallback = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'fallback:42:true');
+    assert.deepStrictEqual(moduleFallbackRequests, [
+      {
+        type: 'internal',
+        specifier: 'file:///bundle/main.js',
+        rawSpecifier: 'main.js',
+        referrer: 'file:///bundle/',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///bundle/message.js',
+        rawSpecifier: './message.js',
+        referrer: 'file:///bundle/main.js',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///bundle/value.json',
+        rawSpecifier: './value.json',
+        referrer: 'file:///bundle/main.js',
+        attributes: [{ name: 'type', value: 'json' }],
+      },
+    ]);
+  },
+};
+
+export const asyncStartupModuleFallbackPrefersBundle = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          import { local } from './local.js';
+          import { remote } from './remote.js';
+
+          export default {
+            fetch() {
+              return new Response(local + ':' + remote);
+            },
+          };
+        `,
+        'local.js': "export const local = 'local';",
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'local:remote');
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier),
+      ['file:///bundle/remote.js']
+    );
+  },
+};
+
+export const asyncStartupModuleFallbackRequiresAllFlags = {
+  test(ctrl, env, ctx) {
+    const requiredFlags = [
+      'allow_insecure_inefficient_logged_eval',
+      'dynamic_worker_async_startup',
+      'new_module_registry',
+    ];
+    for (const omittedFlag of requiredFlags) {
+      assert.throws(
+        () =>
+          env.loader.load({
+            compatibilityDate: '2025-01-01',
+            allowExperimental: true,
+            compatibilityFlags: requiredFlags.filter(
+              (flag) => flag !== omittedFlag
+            ),
+            mainModule: 'main.js',
+            globalOutbound: ctx.exports.Outbound({}),
+          }),
+        /Dynamic Worker code must contain at least one module/
+      );
+    }
+  },
+};
+
+export const runtimeDynamicImportModuleFallback = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    activeModuleFallbackRequests = 0;
+    maxActiveModuleFallbackRequests = 0;
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+        'nodejs_compat',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          import { createRequire } from 'node:module';
+          const require = createRequire(import.meta.url);
+
+          export default {
+            async fetch() {
+              const { value, moduleUrl, resolvedNested, loadNested } =
+                await import('./runtime-redirect.js');
+              const nested = await loadNested();
+              const json = await import('./runtime-value.json', {
+                with: { type: 'json' },
+              });
+              const query = await import('./runtime-query.js?version=1');
+              const nestedQuery = await query.loadNestedQuery();
+              const concurrent = await Promise.all([
+                import('./concurrent-a.js'),
+                import('./concurrent-b.js'),
+              ]);
+              let requireResult = 'unexpected-success';
+              try {
+                require('./runtime-value.json');
+              } catch (error) {
+                if (error.message.includes('Module not found')) {
+                  requireResult = 'require-blocked';
+                }
+              }
+              return new Response(
+                value + ':' + nested + ':' + moduleUrl + ':' + resolvedNested + ':' +
+                json.default.answer + ':' + query.default + ':' + nestedQuery + ':' +
+                concurrent.map(({ default: item }) => item).join('') + ':' + requireResult
+              );
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(
+      await response.text(),
+      'runtime:dependency:nested:file:///canonical/runtime.js:' +
+        'file:///canonical/runtime-nested.js:42:query:nested-query:ab:require-blocked'
+    );
+    assert.deepStrictEqual(moduleFallbackRequests.slice(0, 7), [
+      {
+        type: 'import',
+        specifier: 'file:///bundle/runtime-redirect.js',
+        rawSpecifier: './runtime-redirect.js',
+        referrer: 'file:///bundle/main.js',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///canonical/runtime.js',
+        rawSpecifier: './runtime-redirect.js',
+        referrer: 'file:///bundle/main.js',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///canonical/runtime-dependency.js',
+        rawSpecifier: './runtime-dependency.js',
+        referrer: 'file:///canonical/runtime.js',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///canonical/runtime-nested.js',
+        rawSpecifier: './runtime-nested.js',
+        referrer: 'file:///canonical/runtime.js',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///bundle/runtime-value.json',
+        rawSpecifier: './runtime-value.json',
+        referrer: 'file:///bundle/main.js',
+        attributes: [{ name: 'type', value: 'json' }],
+      },
+      {
+        type: 'import',
+        specifier: 'file:///bundle/runtime-query.js?version=1',
+        rawSpecifier: './runtime-query.js?version=1',
+        referrer: 'file:///bundle/main.js',
+      },
+      {
+        type: 'import',
+        specifier: 'file:///bundle/runtime-query-child.js?version=2',
+        rawSpecifier: './runtime-query-child.js?version=2',
+        referrer: 'file:///bundle/runtime-query.js?version=1',
+      },
+    ]);
+    assert.deepStrictEqual(
+      moduleFallbackRequests.slice(7).map(({ specifier }) => specifier),
+      ['file:///bundle/concurrent-a.js', 'file:///bundle/concurrent-b.js']
+    );
+    assert.strictEqual(maxActiveModuleFallbackRequests, 2);
+  },
+};
+
+export const runtimeDynamicImportModuleFallbackQueryIdentity = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          export default {
+            async fetch() {
+              const first = await import('./query-identity.js?version=1');
+              const repeated = await import('./query-identity.js?version=1');
+              const second = await import('./query-identity.js?version=2');
+              const redirected = await import('./queryless-redirect.js?version=1');
+              return Response.json({
+                repeated: first === repeated,
+                distinct: first !== second,
+                versions: [first.version, second.version],
+                urls: [first.url, second.url],
+                redirected: redirected.default,
+                redirectedUrl: redirected.url,
+              });
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.deepStrictEqual(await response.json(), {
+      repeated: true,
+      distinct: true,
+      versions: [1, 2],
+      urls: [
+        'file:///bundle/query-identity.js?version=1',
+        'file:///bundle/query-identity.js?version=2',
+      ],
+      redirected: 'redirected',
+      redirectedUrl: 'file:///bundle/queryless-redirect.js',
+    });
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier),
+      [
+        'file:///bundle/query-identity.js?version=1',
+        'file:///bundle/query-identity.js?version=2',
+        'file:///bundle/queryless-redirect.js?version=1',
+        'file:///bundle/queryless-redirect.js',
+      ]
+    );
+  },
+};
+
+export const runtimeDynamicImportFallbackRedirectCycle = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          export default {
+            async fetch() {
+              try {
+                await import('./redirect-cycle-a.js?version=1');
+                return new Response('loaded');
+              } catch {
+                return new Response('cycle-rejected');
+              }
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'cycle-rejected');
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier),
+      [
+        'file:///bundle/redirect-cycle-a.js?version=1',
+        'file:///bundle/redirect-cycle-b.js?version=2',
+      ]
+    );
   },
 };

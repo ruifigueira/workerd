@@ -4472,7 +4472,7 @@ export interface WorkerLoaderWorkerCode {
   allowExperimental?: boolean;
   limits?: workerdResourceLimits;
   mainModule: string;
-  modules: Record<string, string | WebAssembly.Module | WorkerLoaderModule>;
+  modules?: Record<string, string | WebAssembly.Module | WorkerLoaderModule>;
   env?: any;
   globalOutbound?: Fetcher | null;
   tails?: Fetcher[];

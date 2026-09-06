@@ -2277,8 +2277,7 @@ KJ_TEST("A URL can hold distinct modules per context type (bundle shadow vs buil
     CompilationObserver compilationObserver;
 
     // A worker-bundle module that shadows a builtin name. It also performs a
-    // dynamic import so the referrer probe is exercised for a URL that has
-    // entries under multiple context types.
+    // dynamic import from a URL that has entries under multiple context types.
     ModuleBundle::BundleBuilder bundleBuilder(BASE);
     bundleBuilder.addEsmModule(
         "test:thing", "export default 'shadow'; export const p = import('file:///dep');"_kjc);
@@ -2319,8 +2318,7 @@ KJ_TEST("A URL can hold distinct modules per context type (bundle shadow vs buil
       KJ_ASSERT(kj::str(ModuleRegistry::resolve(js, "test:thing", "default"_kjc,
                     ResolveContext::Type::PUBLIC_BUILTIN)) == "builtin");
 
-      // The shadow's dynamic import resolved: the referrer probe identified the
-      // bundle-typed entry for the shared URL.
+      // The shadow's dynamic import uses its bundle resolution context.
       auto p = ModuleRegistry::resolve(js, "test:thing", "p"_kjc, ResolveContext::Type::BUNDLE);
       auto promise = v8::Local<v8::Value>(p).As<v8::Promise>();
       js.runMicrotasks();
@@ -3478,6 +3476,115 @@ KJ_TEST("Fallback receives REQUIRE source through require() resolution") {
 
 // ======================================================================================
 
+KJ_TEST("Fallback can keep cached modules unavailable to require") {
+  ResolveObserverImpl resolveObserver;
+  auto moduleUrl = "file:///cached"_url;
+  auto source = kj::str("export default 123;");
+  size_t calls = 0;
+  auto fallback = ModuleBundle::newFallbackBundle(
+      [&](const ResolveContext&) -> kj::Maybe<ModuleBundle::Resolution> {
+    ++calls;
+    return kj::Maybe<ModuleBundle::Resolution>(
+        Module::newEsm(moduleUrl.clone(), Module::Type::FALLBACK, source.asPtr()));
+  }, modules::SupportsRequire::NO);
+  auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                      .add(kj::mv(fallback))
+                      .finish();
+
+  ResolveContext importContext{
+    .type = ResolveContext::Type::BUNDLE,
+    .source = ResolveContext::Source::DYNAMIC_IMPORT,
+    .normalizedSpecifier = moduleUrl,
+    .referrerNormalizedSpecifier = BASE,
+  };
+  KJ_ASSERT(registry->lookup(importContext, resolveObserver) != kj::none);
+
+  ResolveContext requireContext{
+    .type = ResolveContext::Type::BUNDLE,
+    .source = ResolveContext::Source::REQUIRE,
+    .normalizedSpecifier = moduleUrl,
+    .referrerNormalizedSpecifier = BASE,
+  };
+  KJ_ASSERT(registry->lookup(requireContext, resolveObserver) == kj::none);
+  KJ_ASSERT(calls == 1);
+}
+
+KJ_TEST("Repeated async fallback resolution does not create a self-alias") {
+  ResolveObserverImpl resolveObserver;
+  auto moduleUrl = "file:///async"_url;
+  auto source = kj::str("export default 123;");
+  auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                      .add(ModuleBundle::newAsyncFallbackBundle())
+                      .finish();
+  ResolveContext context{
+    .type = ResolveContext::Type::BUNDLE,
+    .source = ResolveContext::Source::DYNAMIC_IMPORT,
+    .normalizedSpecifier = moduleUrl,
+    .referrerNormalizedSpecifier = BASE,
+  };
+
+  registry->storeAsyncResolution(
+      context, Module::newEsm(moduleUrl.clone(), Module::Type::FALLBACK, source.asPtr()));
+  registry->storeAsyncResolution(
+      context, Module::newEsm(moduleUrl.clone(), Module::Type::FALLBACK, source.asPtr()));
+  KJ_ASSERT(registry->lookup(context, resolveObserver) != kj::none);
+}
+
+KJ_TEST("Async fallback rejects self-redirects and keeps the first redirect") {
+  ResolveObserverImpl resolveObserver;
+  auto moduleUrl = "file:///async"_url;
+  auto first = "file:///first"_url;
+  auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                      .add(ModuleBundle::newAsyncFallbackBundle())
+                      .finish();
+  ResolveContext context{
+    .type = ResolveContext::Type::BUNDLE,
+    .source = ResolveContext::Source::DYNAMIC_IMPORT,
+    .normalizedSpecifier = moduleUrl,
+    .referrerNormalizedSpecifier = BASE,
+  };
+
+  KJ_EXPECT_THROW_MESSAGE("Async module fallback redirected a module to itself",
+      registry->storeAsyncResolution(context, kj::str(moduleUrl.getHref())));
+  KJ_EXPECT_THROW_MESSAGE("Async module fallback redirected a module to an invalid URL",
+      registry->storeAsyncResolution(context, kj::str("https://")));
+  registry->storeAsyncResolution(context, kj::str(first.getHref()));
+  registry->storeAsyncResolution(context, kj::str("file:///second"));
+  auto lookup = registry->lookupWithUnresolved(context, resolveObserver);
+  KJ_ASSERT(KJ_ASSERT_NONNULL(lookup.unresolvedSpecifier) == first);
+}
+
+KJ_TEST("Only lookups that consult the fallback report an unresolved specifier") {
+  ResolveObserverImpl resolveObserver;
+  auto moduleUrl = "file:///missing"_url;
+  auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                      .add(ModuleBundle::newAsyncFallbackBundle())
+                      .finish();
+
+  auto lookup = [&](ResolveContext::Type type) {
+    ResolveContext context{
+      .type = type,
+      .source = ResolveContext::Source::STATIC_IMPORT,
+      .normalizedSpecifier = moduleUrl,
+      .referrerNormalizedSpecifier = BASE,
+    };
+    return registry->lookupWithUnresolved(context, resolveObserver);
+  };
+
+  // Bundle lookups search the fallback bundles, so a miss there is a candidate
+  // for asynchronous resolution.
+  KJ_ASSERT(
+      KJ_ASSERT_NONNULL(lookup(ResolveContext::Type::BUNDLE).unresolvedSpecifier) == moduleUrl);
+
+  // Builtin lookups never reach the fallback bundles, so fetching the module would
+  // not make it resolvable.
+  KJ_ASSERT(lookup(ResolveContext::Type::BUILTIN).unresolvedSpecifier == kj::none);
+  KJ_ASSERT(lookup(ResolveContext::Type::BUILTIN_ONLY).unresolvedSpecifier == kj::none);
+  KJ_ASSERT(lookup(ResolveContext::Type::PUBLIC_BUILTIN).unresolvedSpecifier == kj::none);
+}
+
+// ======================================================================================
+
 KJ_TEST("Dynamic import from a redirected fallback module works") {
   // Reproduces the bug where a module loaded via a fallback redirect fails to
   // perform a dynamic import because V8's script origin (the module's canonical
@@ -3544,6 +3651,124 @@ KJ_TEST("Dynamic import from a redirected fallback module works") {
       js.throwException(kj::mv(exception));
     }
   });
+}
+
+// ======================================================================================
+
+KJ_TEST("Fallback receives the query string only with CANONICAL_FALLBACK_URLS") {
+  using Options = ModuleRegistry::Builder::Options;
+  struct Case {
+    Options options;
+    kj::StringPtr expectedSpecifier;
+  };
+  const Case cases[] = {
+    {Options::ALLOW_FALLBACK, "file:///thing"_kj},
+    {Options::ALLOW_FALLBACK | Options::CANONICAL_FALLBACK_URLS, "file:///thing?v=1"_kj},
+  };
+
+  for (auto& testCase: cases) {
+    kj::Vector<kj::String> received;
+    auto source = kj::str("export const url = import.meta.url;");
+    auto fallback = ModuleBundle::newFallbackBundle(
+        [&](const ResolveContext& context) -> kj::Maybe<ModuleBundle::Resolution> {
+      received.add(kj::str(context.normalizedSpecifier.getHref()));
+      return kj::Maybe<ModuleBundle::Resolution>(Module::newEsm(
+          context.normalizedSpecifier.clone(), Module::Type::FALLBACK, source.asPtr()));
+    });
+    auto registry = ModuleRegistry::Builder(BASE, testCase.options).add(kj::mv(fallback)).finish();
+
+    PREAMBLE([&](Lock& js) {
+      CompilationObserver compilationObserver;
+      auto attached = registry->attachToIsolate(js, compilationObserver);
+      JSG_TRY(js) {
+        auto url = ModuleRegistry::resolve(js, "file:///thing?v=1", "url"_kjc);
+        // The instance URL always keeps the query string; only the fallback
+        // protocol differs.
+        KJ_ASSERT(kj::str(url) == "file:///thing?v=1", url);
+      }
+      JSG_CATCH(exception) {
+        js.throwException(kj::mv(exception));
+      }
+    });
+
+    KJ_ASSERT(received.size() == 1, received.size());
+    KJ_ASSERT(received[0] == testCase.expectedSpecifier, received[0], testCase.expectedSpecifier);
+  }
+}
+
+// ======================================================================================
+
+KJ_TEST("Redirected fallback module URLs follow CANONICAL_FALLBACK_URLS") {
+  // The fallback redirects file:///pkg to file:///canonical/pkg/index.mjs, which
+  // statically imports './dep.mjs'. Without CANONICAL_FALLBACK_URLS the import
+  // resolves against the import specifier (file:///dep.mjs) and import.meta.url is
+  // the import specifier. With it, both use the redirect target.
+  using Options = ModuleRegistry::Builder::Options;
+  struct Case {
+    Options options;
+    kj::StringPtr expectedDep;
+    kj::StringPtr expectedUrl;
+  };
+  const Case cases[] = {
+    {Options::ALLOW_FALLBACK, "alias-dep"_kj, "file:///pkg"_kj},
+    {Options::ALLOW_FALLBACK | Options::CANONICAL_FALLBACK_URLS, "canonical-dep"_kj,
+      "file:///canonical/pkg/index.mjs"_kj},
+  };
+
+  const auto pkg = "file:///pkg"_url;
+  const auto canonical = "file:///canonical/pkg/index.mjs"_url;
+  const auto canonicalDep = "file:///canonical/pkg/dep.mjs"_url;
+  const auto aliasDep = "file:///dep.mjs"_url;
+
+  for (auto& testCase: cases) {
+    auto pkgSource = kj::str("import dep from './dep.mjs';\n"
+                             "export default dep;\n"
+                             "export const url = import.meta.url;\n");
+    auto canonicalDepSource = kj::str("export default 'canonical-dep';");
+    auto aliasDepSource = kj::str("export default 'alias-dep';");
+
+    auto fallback = ModuleBundle::newFallbackBundle(
+        [&](const ResolveContext& context) -> kj::Maybe<ModuleBundle::Resolution> {
+      if (context.normalizedSpecifier == pkg) {
+        return kj::Maybe<ModuleBundle::Resolution>(kj::str(canonical.getHref()));
+      }
+      if (context.normalizedSpecifier == canonical) {
+        return kj::Maybe<ModuleBundle::Resolution>(
+            Module::newEsm(canonical.clone(), Module::Type::FALLBACK, pkgSource.asPtr()));
+      }
+      if (context.normalizedSpecifier == canonicalDep) {
+        return kj::Maybe<ModuleBundle::Resolution>(Module::newEsm(
+            canonicalDep.clone(), Module::Type::FALLBACK, canonicalDepSource.asPtr()));
+      }
+      if (context.normalizedSpecifier == aliasDep) {
+        return kj::Maybe<ModuleBundle::Resolution>(
+            Module::newEsm(aliasDep.clone(), Module::Type::FALLBACK, aliasDepSource.asPtr()));
+      }
+      return kj::none;
+    });
+    auto registry = ModuleRegistry::Builder(BASE, testCase.options).add(kj::mv(fallback)).finish();
+
+    PREAMBLE([&](Lock& js) {
+      CompilationObserver compilationObserver;
+      auto attached = registry->attachToIsolate(js, compilationObserver);
+      JSG_TRY(js) {
+        auto dep = ModuleRegistry::resolve(js, "file:///pkg", "default"_kjc);
+        KJ_ASSERT(kj::str(dep) == testCase.expectedDep, dep, testCase.expectedDep);
+        auto url = ModuleRegistry::resolve(js, "file:///pkg", "url"_kjc);
+        KJ_ASSERT(kj::str(url) == testCase.expectedUrl, url, testCase.expectedUrl);
+      }
+      JSG_CATCH(exception) {
+        js.throwException(kj::mv(exception));
+      }
+    });
+  }
+}
+
+// ======================================================================================
+
+KJ_TEST("CANONICAL_FALLBACK_URLS requires ALLOW_FALLBACK") {
+  KJ_EXPECT_THROW_MESSAGE("CANONICAL_FALLBACK_URLS requires ALLOW_FALLBACK",
+      ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::CANONICAL_FALLBACK_URLS));
 }
 
 }  // namespace

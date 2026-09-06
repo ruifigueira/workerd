@@ -127,8 +127,6 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     IoContext& ioctx,
     CompatibilityDateValidation compatDateValidation,
     WorkerCode code) {
-  auto extractedSource = extractSource(js, code);
-
   // Set up compat flags for Python Workers so that the caller doesn't have to specify them
   // manually.
   if (code.mainModule.endsWith(".py"_kj)) {
@@ -172,6 +170,7 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
 
   auto ownCompatFlags = extractCompatFlags(js, code, compatDateValidation);
   CompatibilityFlags::Reader compatFlags = *ownCompatFlags;
+  auto extractedSource = extractSource(js, code, compatFlags);
 
   Frankenvalue env;
   KJ_IF_SOME(codeEnv, code.env) {
@@ -223,8 +222,9 @@ DynamicWorkerSource WorkerLoader::toDynamicWorkerSource(jsg::Lock& js,
     };
   }
 
-  return {.source = kj::mv(extractedSource),
+  return {.source = kj::mv(extractedSource.source),
     .compatibilityFlags = compatFlags,
+    .codeSize = extractedSource.codeSize,
     .limits = code.limits,
     .env = kj::mv(env),
     .globalOutbound = kj::mv(globalOutbound),
@@ -247,112 +247,120 @@ static Worker::Script::ModuleContent extractWasmModuleContent(
   };
 }
 
-Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& code) {
-  JSG_REQUIRE(code.modules.fields.size() > 0, TypeError,
-      "Dynamic Worker code must contain at least one module.");
+WorkerLoader::ExtractedSource WorkerLoader::extractSource(
+    jsg::Lock& js, WorkerCode& code, CompatibilityFlags::Reader compatFlags) {
+  bool allowEmptyModules = compatFlags.getDynamicWorkerAsyncStartup() &&
+      compatFlags.getExperimentalAllowEvalAlways() && isNewModuleRegistryEnabled(compatFlags);
+  kj::Array<Worker::Script::Module> modules;
+  KJ_IF_SOME(codeModules, code.modules) {
+    JSG_REQUIRE(allowEmptyModules || codeModules.fields.size() > 0, TypeError,
+        "Dynamic Worker code must contain at least one module.");
+    modules = KJ_MAP(entry, codeModules.fields) -> Worker::Script::Module {
+      KJ_SWITCH_ONEOF(entry.value) {
+        KJ_CASE_ONEOF(text, kj::String) {
+          if (entry.name.endsWith(".py"_kj)) {
+            return {
+              .name = entry.name,
+              .content = Worker::Script::PythonModule{.body = text},
+            };
+          }
 
-  auto modules = KJ_MAP(entry, code.modules.fields) -> Worker::Script::Module {
-    KJ_SWITCH_ONEOF(entry.value) {
-      KJ_CASE_ONEOF(text, kj::String) {
-        if (entry.name.endsWith(".py"_kj)) {
-          return {
-            .name = entry.name,
-            .content = Worker::Script::PythonModule{.body = text},
-          };
-        }
+          if (entry.name.endsWith(".js"_kj)) {
+            return {
+              .name = entry.name,
+              .content = Worker::Script::EsModule{.body = text},
+            };
+          }
 
-        if (entry.name.endsWith(".js"_kj)) {
-          return {
-            .name = entry.name,
-            .content = Worker::Script::EsModule{.body = text},
-          };
-        }
+          // Python packages bundled in Workers can have non-code files (METADATA, RECORD, etc),
+          // so we don't limit file extensions for Python workers.
+          if (code.mainModule.endsWith(".py"_kj) && entry.name.startsWith("python_modules/"_kj)) {
+            return {
+              .name = entry.name,
+              .content = Worker::Script::TextModule{.body = text},
+            };
+          }
 
-        // Python packages bundled in Workers can have non-code files (METADATA, RECORD, etc),
-        // so we don't limit file extensions for Python workers.
-        if (code.mainModule.endsWith(".py"_kj) && entry.name.startsWith("python_modules/"_kj)) {
-          return {
-            .name = entry.name,
-            .content = Worker::Script::TextModule{.body = text},
-          };
-        }
+          if (entry.name.endsWith(".ts"_kj) || entry.name.endsWith(".tsx"_kj) ||
+              entry.name.endsWith(".jsx"_kj)) {
+            JSG_FAIL_REQUIRE(TypeError,
+                "Module name must end with '.js' or '.py' (or the content must be an object ",
+                "indicating the type explicitly). Got: ", entry.name,
+                ". If you're trying to load TypeScript, bundle it first with ",
+                "'@cloudflare/worker-bundler' and pass the generated JavaScript modules.");
+          }
 
-        if (entry.name.endsWith(".ts"_kj) || entry.name.endsWith(".tsx"_kj) ||
-            entry.name.endsWith(".jsx"_kj)) {
           JSG_FAIL_REQUIRE(TypeError,
               "Module name must end with '.js' or '.py' (or the content must be an object ",
-              "indicating the type explicitly). Got: ", entry.name,
-              ". If you're trying to load TypeScript, bundle it first with ",
-              "'@cloudflare/worker-bundler' and pass the generated JavaScript modules.");
+              "indicating the type explicitly). Got: ", entry.name);
         }
+        KJ_CASE_ONEOF(wasmModule, jsg::V8Ref<v8::WasmModuleObject>) {
+          // An already-compiled `WebAssembly.Module` (e.g. from a source phase import).
+          return {
+            .name = entry.name,
+            .content = extractWasmModuleContent(js, wasmModule),
+          };
+        }
+        KJ_CASE_ONEOF(module, Module) {
+          uint fieldCount = (module.js != kj::none) + (module.cjs != kj::none) +
+              (module.text != kj::none) + (module.data != kj::none) + (module.json != kj::none) +
+              (module.py != kj::none) + (module.wasm != kj::none);
+          JSG_REQUIRE(fieldCount == 1, TypeError,
+              "Each module must contain exactly one of 'js', 'cjs', 'text', 'data', 'json', 'py', or 'wasm'. "
+              "Module '",
+              entry.name, "' contained ", fieldCount, " properties.");
 
-        JSG_FAIL_REQUIRE(TypeError,
-            "Module name must end with '.js' or '.py' (or the content must be an object ",
-            "indicating the type explicitly). Got: ", entry.name);
-      }
-      KJ_CASE_ONEOF(wasmModule, jsg::V8Ref<v8::WasmModuleObject>) {
-        // An already-compiled `WebAssembly.Module` (e.g. from a source phase import).
-        return {
-          .name = entry.name,
-          .content = extractWasmModuleContent(js, wasmModule),
-        };
-      }
-      KJ_CASE_ONEOF(module, Module) {
-        uint fieldCount = (module.js != kj::none) + (module.cjs != kj::none) +
-            (module.text != kj::none) + (module.data != kj::none) + (module.json != kj::none) +
-            (module.py != kj::none) + (module.wasm != kj::none);
-        JSG_REQUIRE(fieldCount == 1, TypeError,
-            "Each module must contain exactly one of 'js', 'cjs', 'text', 'data', 'json', 'py', or 'wasm'. "
-            "Module '",
-            entry.name, "' contained ", fieldCount, " properties.");
-
-        return {.name = entry.name, .content = [&]() -> Worker::Script::ModuleContent {
-          KJ_IF_SOME(js, module.js) {
-            // TODO: this might need typescript transpilation too.
-            return Worker::Script::EsModule{.body = js};
-          } else KJ_IF_SOME(cjs, module.cjs) {
-            return Worker::Script::CommonJsModule{.body = cjs};
-          } else KJ_IF_SOME(text, module.text) {
-            return Worker::Script::TextModule{.body = text};
-          } else KJ_IF_SOME(data, module.data) {
-            // The kj::Array<const byte> produced by jsg::asBytes() points into a V8
-            // BackingStore. If the user passed a *resizable* ArrayBuffer they can call
-            // resize(0) (or transfer/detach) after load() returns but before the child
-            // isolate is compiled asynchronously, leaving us with a (ptr,len) into
-            // PROT_NONE pages. Copy now so the bytes survive until compileDataGlobal().
-            data = kj::heapArray<const kj::byte>(data.asPtr());
-            return Worker::Script::DataModule{.body = data};
-          } else KJ_IF_SOME(json, module.json) {
-            kj::StringPtr serialized =
-                module.serializedJson.emplace(js.serializeJson(kj::mv(json)));
-            // We moved out of `json`, making it an empty V8Ref, explicitly
-            // clear out the field as we don't intend to re-use this
-            module.json = kj::none;
-            return Worker::Script::JsonModule{.body = serialized};
-          } else KJ_IF_SOME(py, module.py) {
-            return Worker::Script::PythonModule{.body = py};
-          } else KJ_IF_SOME(wasm, module.wasm) {
-            KJ_SWITCH_ONEOF(wasm) {
-              KJ_CASE_ONEOF(bytes, kj::Array<const byte>) {
-                // Same as `data` above: copy out of the V8 BackingStore before going async.
-                bytes = kj::heapArray<const kj::byte>(bytes.asPtr());
-                return Worker::Script::WasmModule{.body = bytes};
+          return {.name = entry.name, .content = [&]() -> Worker::Script::ModuleContent {
+            KJ_IF_SOME(js, module.js) {
+              // TODO: this might need typescript transpilation too.
+              return Worker::Script::EsModule{.body = js};
+            } else KJ_IF_SOME(cjs, module.cjs) {
+              return Worker::Script::CommonJsModule{.body = cjs};
+            } else KJ_IF_SOME(text, module.text) {
+              return Worker::Script::TextModule{.body = text};
+            } else KJ_IF_SOME(data, module.data) {
+              // The kj::Array<const byte> produced by jsg::asBytes() points into a V8
+              // BackingStore. If the user passed a *resizable* ArrayBuffer they can call
+              // resize(0) (or transfer/detach) after load() returns but before the child
+              // isolate is compiled asynchronously, leaving us with a (ptr,len) into
+              // PROT_NONE pages. Copy now so the bytes survive until compileDataGlobal().
+              data = kj::heapArray<const kj::byte>(data.asPtr());
+              return Worker::Script::DataModule{.body = data};
+            } else KJ_IF_SOME(json, module.json) {
+              kj::StringPtr serialized =
+                  module.serializedJson.emplace(js.serializeJson(kj::mv(json)));
+              // We moved out of `json`, making it an empty V8Ref, explicitly
+              // clear out the field as we don't intend to re-use this
+              module.json = kj::none;
+              return Worker::Script::JsonModule{.body = serialized};
+            } else KJ_IF_SOME(py, module.py) {
+              return Worker::Script::PythonModule{.body = py};
+            } else KJ_IF_SOME(wasm, module.wasm) {
+              KJ_SWITCH_ONEOF(wasm) {
+                KJ_CASE_ONEOF(bytes, kj::Array<const byte>) {
+                  // Same as `data` above: copy out of the V8 BackingStore before going async.
+                  bytes = kj::heapArray<const kj::byte>(bytes.asPtr());
+                  return Worker::Script::WasmModule{.body = bytes};
+                }
+                KJ_CASE_ONEOF(wasmModule, jsg::V8Ref<v8::WasmModuleObject>) {
+                  // No copy needed here: the wire bytes are owned by the compiled module itself,
+                  // not the V8 heap.
+                  return extractWasmModuleContent(js, wasmModule);
+                }
               }
-              KJ_CASE_ONEOF(wasmModule, jsg::V8Ref<v8::WasmModuleObject>) {
-                // No copy needed here: the wire bytes are owned by the compiled module itself,
-                // not the V8 heap.
-                return extractWasmModuleContent(js, wasmModule);
-              }
+              KJ_UNREACHABLE;
+            } else {
+              KJ_UNREACHABLE;
             }
-            KJ_UNREACHABLE;
-          } else {
-            KJ_UNREACHABLE;
-          }
-        }()};
+          }()};
+        }
       }
-    }
-    KJ_UNREACHABLE;
-  };
+      KJ_UNREACHABLE;
+    };
+  } else {
+    JSG_REQUIRE(
+        allowEmptyModules, TypeError, "Dynamic Worker code must contain at least one module.");
+  }
 
   bool isPython = code.mainModule.endsWith(".py"_kj);
   // Disallow Python modules when the main module is a JS module. Also tally up the
@@ -398,10 +406,14 @@ Worker::Script::Source WorkerLoader::extractSource(jsg::Lock& js, WorkerCode& co
       totalCodeSize, " bytes) exceeds the maximum allowed size of ", MAX_DYNAMIC_WORKER_CODE_SIZE,
       " bytes.");
 
-  return Worker::Script::ModulesSource{
-    .mainModule = code.mainModule,
-    .modules = kj::mv(modules),
-    .isPython = isPython,
+  return {
+    .source =
+        Worker::Script::ModulesSource{
+          .mainModule = code.mainModule,
+          .modules = kj::mv(modules),
+          .isPython = isPython,
+        },
+    .codeSize = totalCodeSize,
   };
 }
 

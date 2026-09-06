@@ -569,6 +569,7 @@ class WorkerStubChannel: public kj::Refcounted {
 struct DynamicWorkerSource {
   WorkerSource source;
   CompatibilityFlags::Reader compatibilityFlags;
+  size_t codeSize;
 
   kj::Maybe<ResourceLimits> limits;
 
@@ -602,6 +603,7 @@ struct DynamicWorkerSource {
     return {
       .source = source.clone(),
       .compatibilityFlags = compatibilityFlags,
+      .codeSize = codeSize,
       .limits = limits.map([](auto& limits) { return limits.clone(); }),
       .env = env.clone(),
       .globalOutbound = mapAddRef(globalOutbound),
