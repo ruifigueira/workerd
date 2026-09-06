@@ -1,0 +1,23 @@
+src/workerd/jsg/jsg.c++
+  s_fec02d7784a34e::t_da8e2a62c98345 468-490
+src/workerd/jsg/modules-new.c++
+  s_fec02d7784a34e::t_553195006a8f8c 876-912,2230-2234,2243,2249-2255,2444-2464,2490
+src/workerd/jsg/modules-new.h
+  s_fec02d7784a34e::t_99070127aaeb29 231,296-298,300,728,742,781-782,796-798,818,848-849
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "b910201871b3aa1db3f10069d4b6e3630ce83c23",
+  "prompts": {},
+  "sessions": {
+    "s_fec02d7784a34e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f8a7b89feffeUbZSZJRbZrDWlK",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
