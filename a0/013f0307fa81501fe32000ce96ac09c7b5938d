@@ -3,6 +3,7 @@ src/workerd/api/worker-loader.c++
 src/workerd/jsg/modules-new.c++
   s_fec02d7784a34e::t_02755354998ed0 21-40,759-775,778-783,798-812,890-893,941-958,1231,1270-1275,1310-1311,1348-1351,1680,1795,1797-1799,1802-1805,1818-1858,1862,1865-1872,1875,1878-1879,1994-2000,2307-2315,2325,2328-2355,2409-2412,2435,2500-2504,2520-2521,2523-2525,2529-2531,2607-2627,2686-2689
   s_fa9479163d0eac::t_b72fafece4347a 247-249,251-252,676,732,752,776-777,1301,1328-1330,1396,1417-1418,1555-1556,1562-1576,1593,2450,2453-2464,2490-2494,2519
+  s_fa9479163d0eac::t_628c7f61479100 245-249,251-252,673,675-676,732,752,776-777,1297,1300-1301,1328-1330,1396,1417-1418,1555-1556,1560-1576,1593,2450-2464,2489-2494,2517,2519
 src/workerd/server/workerd-api.c++
   s_fec02d7784a34e::t_9a7196c2f842f9 873-950,958-959,1135-1137,1146-1153
 types/generated-snapshot/experimental/index.d.ts
@@ -15,8 +16,12 @@ types/generated-snapshot/index.ts
   s_fec02d7784a34e::t_f62321e4799d30 4198
 src/workerd/jsg/modules-new.h
   s_fa9479163d0eac::t_7969890ad69485 210-211
+  s_fa9479163d0eac::t_a52c9f95b9a8f7 208-211,481-482
 src/workerd/api/tests/worker-loader-async-startup-test.js
   s_fa9479163d0eac::t_403f22ee06e2fe 52-56,63-66,69-113,442-444,448-449,463-464,477-478,480,499-504,512-523,526,532-622,623-631
+  s_fa9479163d0eac::t_79b9875e168c48 52-56,63-66,69-113,442-444,448-449,463-464,477-478,480,499-504,512-523,526,532-631
+src/workerd/jsg/modules-new-test.c++
+  s_fa9479163d0eac::t_5d11f440169377 1755,1767-1768,1777-1779,2279,2320
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -24,6 +29,14 @@ src/workerd/api/tests/worker-loader-async-startup-test.js
   "base_commit_sha": "a0013f0307fa81501fe32000ce96ac09c7b5938d",
   "prompts": {},
   "sessions": {
+    "s_7eef97e0968964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f82c5b9b9ffeBdQCT0VqCU1A9F",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
     "s_fa9479163d0eac": {
       "agent_id": {
         "tool": "opencode",
