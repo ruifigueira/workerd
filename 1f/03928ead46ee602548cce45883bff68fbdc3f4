@@ -1,0 +1,25 @@
+src/workerd/api/tests/worker-loader-async-startup-test.js
+  s_fa9479163d0eac::t_79b9875e168c48 52-56,63-66,69-113,442-444,448-449,463-464,477-478,480,499-504,512-523,526,532-631
+src/workerd/jsg/modules-new-test.c++
+  s_fa9479163d0eac::t_5d11f440169377 1755,1767-1768,1777-1779,2279,2320
+src/workerd/jsg/modules-new.c++
+  s_fa9479163d0eac::t_628c7f61479100 245-249,251-252,673,675-676,732,752,776-777,1297,1300-1301,1328-1330,1396,1417-1418,1555-1556,1560-1576,1593,2450-2464,2489-2494,2517,2519
+src/workerd/jsg/modules-new.h
+  s_fa9479163d0eac::t_a52c9f95b9a8f7 208-211,481-482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "1f03928ead46ee602548cce45883bff68fbdc3f4",
+  "prompts": {},
+  "sessions": {
+    "s_fa9479163d0eac": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f85431e70ffeHn7BDR8SxOt97X",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
