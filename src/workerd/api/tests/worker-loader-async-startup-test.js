@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 import assert from 'node:assert';
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import addWasmBytes from './add.wasm.bin';
 
 let outboundRequests = 0;
 let sourceRequests = 0;
@@ -110,6 +111,16 @@ export class Outbound extends WorkerEntrypoint {
             headers: {
               location: 'file:///bundle/redirect-cycle-a.js?version=1',
             },
+          });
+        case 'file:///bundle/add.wasm':
+        case 'file:///bundle/add-runtime.wasm':
+          return new Response(addWasmBytes, {
+            headers: { 'content-type': 'application/wasm' },
+          });
+        case 'file:///bundle/payload.bin':
+        case 'file:///bundle/payload-runtime.bin':
+          return new Response(new Uint8Array([1, 2, 3, 4]), {
+            headers: { 'content-type': 'application/octet-stream;foo=bar' },
           });
         case 'file:///bundle/concurrent-a.js':
         case 'file:///bundle/concurrent-b.js': {
@@ -547,6 +558,69 @@ export const asyncStartupModuleFallbackPrefersBundle = {
     assert.deepStrictEqual(
       moduleFallbackRequests.map(({ specifier }) => specifier),
       ['file:///bundle/remote.js']
+    );
+  },
+};
+
+export const moduleFallbackBinaryResponses = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          import source addSource from './add.wasm';
+          import addDefault from './add.wasm';
+          import payload from './payload.bin';
+
+          const startupAdd = new WebAssembly.Instance(addSource).exports.add;
+
+          export default {
+            async fetch() {
+              const runtimeSource = await import.source('./add-runtime.wasm');
+              const runtimeAdd = new WebAssembly.Instance(runtimeSource).exports.add;
+              const runtimePayload = (await import('./payload-runtime.bin')).default;
+              return Response.json({
+                startupIsModule: addSource instanceof WebAssembly.Module,
+                defaultIsModule: addDefault instanceof WebAssembly.Module,
+                startupSum: startupAdd(2, 3),
+                startupPayload: Array.from(new Uint8Array(payload)),
+                runtimeIsModule: runtimeSource instanceof WebAssembly.Module,
+                runtimeSum: runtimeAdd(40, 2),
+                runtimePayload: Array.from(new Uint8Array(runtimePayload)),
+              });
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.deepStrictEqual(await response.json(), {
+      startupIsModule: true,
+      defaultIsModule: true,
+      startupSum: 5,
+      startupPayload: [1, 2, 3, 4],
+      runtimeIsModule: true,
+      runtimeSum: 42,
+      runtimePayload: [1, 2, 3, 4],
+    });
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier),
+      [
+        'file:///bundle/add.wasm',
+        'file:///bundle/payload.bin',
+        'file:///bundle/add-runtime.wasm',
+        'file:///bundle/payload-runtime.bin',
+      ]
     );
   },
 };

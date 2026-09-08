@@ -5187,20 +5187,23 @@ struct FetchedDynamicModule {
   DynamicModuleFallbackState::Resolution resolution;
 };
 
-static kj::Promise<kj::String> readDynamicModuleResponse(
+static kj::Promise<kj::Array<kj::byte>> readDynamicModuleResponse(
     kj::AsyncInputStream& input, const DynamicModuleFallbackState& state) {
-  auto buffer = kj::heapArray<char>(64 * 1024);
-  kj::Vector<char> result;
+  auto buffer = kj::heapArray<kj::byte>(64 * 1024);
+  kj::Vector<kj::byte> result;
   for (;;) {
     auto size = co_await input.tryRead(buffer.begin(), 1, buffer.size());
     if (size == 0) break;
     state.accountCodeSize(size);
     result.addAll(buffer.first(size));
   }
-  result.add('\0');
-  co_return kj::String(result.releaseAsArray());
+  co_return result.releaseAsArray();
 }
 
+// Asks the dynamic worker's globalOutbound to supply a module the bundle does not contain. This
+// speaks the V2 fallback service protocol (see fallback-service.h): a POST whose JSON body is a
+// `FallbackServiceRequest`, answered with a 301 redirect or a 200 whose body is interpreted by
+// Content-Type.
 static kj::Promise<FetchedDynamicModule> fetchDynamicModule(IoContext& context,
     DynamicModuleFallbackState::Request request,
     CompatibilityFlags::Reader featureFlags,
@@ -5240,19 +5243,15 @@ static kj::Promise<FetchedDynamicModule> fetchDynamicModule(IoContext& context,
 
   JSG_REQUIRE(response.statusCode == 200, Error, "Dynamic module fallback failed for ",
       request.specifier.getHref(), " with status ", response.statusCode, ".");
+  auto bodyKind = fallback::responseBodyKind(*response.headers);
   auto responseBody = co_await readDynamicModuleResponse(*response.body, *state);
 
   capnp::MallocMessageBuilder moduleMessage;
   auto moduleBuilder = moduleMessage.initRoot<config::Worker::Module>();
-  json.handleByAnnotation<config::Worker::Module>();
-  json.decode(responseBody, moduleBuilder);
-  if (moduleBuilder.hasName()) {
-    JSG_REQUIRE(moduleBuilder.getName() == specifier, TypeError,
-        "Dynamic module fallback returned a module name that does not match the requested "
-        "specifier.");
-  } else {
-    moduleBuilder.setName(specifier);
-  }
+  fallback::decodeModuleResponse(bodyKind, responseBody, specifier, moduleBuilder);
+  JSG_REQUIRE(moduleBuilder.getName() == specifier, TypeError,
+      "Dynamic module fallback returned a module name that does not match the requested "
+      "specifier.");
   auto flags = jsg::modules::Module::Flags::NO_REQUIRE;
   if (request.source == jsg::modules::ResolveContext::Source::INTERNAL) {
     flags = flags | jsg::modules::Module::Flags::MAIN;

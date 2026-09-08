@@ -171,6 +171,7 @@ class MimeType final {
       ConstMimeType("application"_kj, "x-www-form-urlencoded"_kj);
   static constexpr ConstMimeType FORM_DATA = ConstMimeType("multipart"_kj, "form-data"_kj);
   static constexpr ConstMimeType OCTET_STREAM = ConstMimeType("application"_kj, "octet-stream"_kj);
+  static constexpr ConstMimeType WASM = ConstMimeType("application"_kj, "wasm"_kj);
   static constexpr ConstMimeType XHTML = ConstMimeType("application"_kj, "xhtml+xml"_kj);
   static constexpr ConstMimeType JAVASCRIPT = ConstMimeType("application"_kj, "javascript"_kj);
   static constexpr ConstMimeType XJAVASCRIPT = ConstMimeType("application"_kj, "x-javascript"_kj);

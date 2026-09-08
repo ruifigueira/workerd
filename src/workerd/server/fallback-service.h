@@ -3,6 +3,7 @@
 #include <workerd/server/workerd.capnp.h>
 
 #include <kj/common.h>
+#include <kj/compat/http.h>
 #include <kj/map.h>
 #include <kj/mutex.h>
 #include <kj/one-of.h>
@@ -27,8 +28,9 @@ namespace workerd::fallback {
 // JSON to pass the details. The specifier and referrer are treated as URLs.
 // Import attributes are included.
 //
-// The fallback service may return either a JSON string describing the module
-// configuration, a 301 redirect to a different module specifier, or an error.
+// The fallback service may return a 301 redirect to a different module
+// specifier, an error, or a 200 whose body is interpreted according to its
+// Content-Type (see ResponseBodyKind).
 enum class ImportType {
   // The import is a static or dynamic import
   IMPORT,
@@ -52,6 +54,28 @@ enum class Version {
 
 using ModuleOrRedirect =
     kj::Maybe<kj::OneOf<kj::String, kj::Own<server::config::Worker::Module::Reader>>>;
+
+// How the body of a 200 response from a fallback service is interpreted.
+enum class ResponseBodyKind {
+  // A JSON-encoded `Worker.Module`. Used for any Content-Type other than the
+  // ones below, or when there is no Content-Type.
+  JSON,
+  // Content-Type `application/wasm`: the body is the WebAssembly module bytes.
+  WASM,
+  // Content-Type `application/octet-stream`: the body is a data module.
+  DATA,
+};
+
+ResponseBodyKind responseBodyKind(const kj::HttpHeaders& headers);
+
+// Fills `module` from the body of a 200 response. A binary body, or a JSON body
+// without a `name`, is named `specifier`. A JSON body that names a module is
+// left as decoded; callers reject a name that differs from `specifier`.
+// Throws if a JSON body cannot be decoded.
+void decodeModuleResponse(ResponseBodyKind kind,
+    kj::ArrayPtr<const kj::byte> body,
+    kj::StringPtr specifier,
+    server::config::Worker::Module::Builder module);
 
 // A persistent client for the fallback service that uses a single background
 // thread with a long-lived HTTP client for all module resolution requests.

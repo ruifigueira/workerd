@@ -53,6 +53,12 @@ export const fallbackModules = {
       throw new Error('Expected fallback Wasm source to be a WebAssembly.Module');
     }
 
+    const rawWasm = await import.source('./raw.wasm');
+    equal(new WebAssembly.Instance(rawWasm).exports.add(2, 3), 5);
+
+    const rawData = new Uint8Array((await import('./raw.bin')).default);
+    equal(Array.from(rawData).join(','), '9,8,7');
+
     const redirected = await import('./redirect.js');
     equal(redirected.default, 'redirect fallback');
 
@@ -87,6 +93,19 @@ function sendJson(response, value) {
   response.writeHead(200, { 'content-type': 'application/json' });
   response.end(JSON.stringify(value));
 }
+
+function sendBinary(response, contentType, bytes) {
+  response.writeHead(200, { 'content-type': contentType });
+  response.end(Buffer.from(bytes));
+}
+
+// (module (func (export "add") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))
+const ADD_WASM = [
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x07, 0x01, 0x60, 0x02,
+  0x7f, 0x7f, 0x01, 0x7f, 0x03, 0x02, 0x01, 0x00, 0x07, 0x07, 0x01, 0x03, 0x61,
+  0x64, 0x64, 0x00, 0x00, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01,
+  0x6a, 0x0b,
+];
 
 async function runWorkerd(configPath) {
   return await new Promise((resolve, reject) => {
@@ -167,6 +186,12 @@ test('module fallback serves V1 and V2 module types', async () => {
           return;
         case 'file:///bundle/module.wasm':
           sendJson(response, { wasm: [0, 97, 115, 109, 1, 0, 0, 0] });
+          return;
+        case 'file:///bundle/raw.wasm':
+          sendBinary(response, 'application/wasm', ADD_WASM);
+          return;
+        case 'file:///bundle/raw.bin':
+          sendBinary(response, 'application/octet-stream', [9, 8, 7]);
           return;
         case 'file:///bundle/redirect.js':
           response.writeHead(301, {
@@ -273,7 +298,7 @@ const unitTests :Workerd.Config = (
     ]);
 
     const v2 = requests.filter((request) => request.version === 'v2');
-    assert.equal(v2.length, 12);
+    assert.equal(v2.length, 14);
     const jsonRequest = v2.find(
       (request) => request.specifier === 'file:///bundle/value.json'
     );

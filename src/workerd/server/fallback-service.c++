@@ -1,5 +1,7 @@
 #include "fallback-service.h"
 
+#include <workerd/util/mimetype.h>
+
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <kj/async-io.h>
@@ -11,6 +13,43 @@
 #include <kj/thread.h>
 
 namespace workerd::fallback {
+
+ResponseBodyKind responseBodyKind(const kj::HttpHeaders& headers) {
+  KJ_IF_SOME(contentType, headers.get(kj::HttpHeaderId::CONTENT_TYPE)) {
+    KJ_IF_SOME(mimeType, MimeType::extract(contentType)) {
+      if (MimeType::WASM == mimeType) return ResponseBodyKind::WASM;
+      if (MimeType::OCTET_STREAM == mimeType) return ResponseBodyKind::DATA;
+    }
+  }
+  return ResponseBodyKind::JSON;
+}
+
+void decodeModuleResponse(ResponseBodyKind kind,
+    kj::ArrayPtr<const kj::byte> body,
+    kj::StringPtr specifier,
+    server::config::Worker::Module::Builder module) {
+  switch (kind) {
+    case ResponseBodyKind::WASM:
+      module.setName(specifier);
+      module.setWasm(body);
+      return;
+    case ResponseBodyKind::DATA:
+      module.setName(specifier);
+      module.setData(body);
+      return;
+    case ResponseBodyKind::JSON: {
+      capnp::JsonCodec json;
+      json.handleByAnnotation<server::config::Worker::Module>();
+      json.decode(body.asChars(), module);
+      if (!module.hasName()) {
+        module.setName(specifier);
+      }
+      return;
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
 namespace {
 
 constexpr kj::StringPtr getMethodFromType(ImportType type) {
@@ -25,52 +64,68 @@ constexpr kj::StringPtr getMethodFromType(ImportType type) {
   KJ_UNREACHABLE;
 }
 
-ModuleOrRedirect handleReturnPayload(
-    kj::Maybe<kj::String> jsonPayload, bool redirect, kj::StringPtr specifier) {
-  KJ_IF_SOME(payload, jsonPayload) {
-    // If the payload is empty then the fallback service failed to fetch the module.
-    if (payload.size() == 0) return kj::none;
+// A 301 response: the target specifier.
+struct Redirect {
+  kj::String location;
+};
 
-    // If redirect is true then the fallback service returned a 301 redirect. The
-    // payload is the specifier of the new target module.
-    if (redirect) {
-      return kj::Maybe(kj::mv(payload));
-    }
+// A 200 response.
+struct Body {
+  ResponseBodyKind kind;
+  kj::Array<kj::byte> bytes;
+};
 
-    // The response from the fallback service must be a valid JSON serialization
-    // of the workerd module configuration. If it is not, or if there is any other
-    // error when processing here, we'll log the exception and return nothing.
-    KJ_TRY {
-      capnp::MallocMessageBuilder moduleMessage;
-      capnp::JsonCodec json;
-      json.handleByAnnotation<server::config::Worker::Module>();
-      auto moduleBuilder = moduleMessage.initRoot<server::config::Worker::Module>();
-      json.decode(payload, moduleBuilder);
+// None when the fallback service returned an error or the request failed.
+using RawResponse = kj::Maybe<kj::OneOf<Redirect, Body>>;
 
-      // If the module fallback service returns a name in the module then it has to
-      // match the specifier we passed in. This is an optional sanity check.
-      if (moduleBuilder.hasName()) {
-        if (moduleBuilder.getName() != specifier) {
-          KJ_LOG(ERROR,
-              "Fallback service failed to fetch module: returned module "
-              "name does not match specifier",
-              moduleBuilder.getName(), specifier);
+// Reads a 200 response into a Body, classifying it by Content-Type.
+Body readBody(kj::HttpClient::Response& response, kj::WaitScope& waitScope) {
+  return Body{
+    .kind = responseBodyKind(*response.headers),
+    .bytes = response.body->readAllBytes().wait(waitScope),
+  };
+}
+
+ModuleOrRedirect handleReturnPayload(RawResponse rawResponse, kj::StringPtr specifier) {
+  KJ_IF_SOME(response, rawResponse) {
+    KJ_SWITCH_ONEOF(response) {
+      KJ_CASE_ONEOF(redirect, Redirect) {
+        return kj::Maybe(kj::mv(redirect.location));
+      }
+      KJ_CASE_ONEOF(body, Body) {
+        // If the body is empty then the fallback service failed to fetch the module.
+        if (body.bytes.size() == 0) return kj::none;
+
+        // If the body cannot be decoded, or there is any other error when processing here,
+        // log the exception and return nothing.
+        KJ_TRY {
+          capnp::MallocMessageBuilder moduleMessage;
+          auto moduleBuilder = moduleMessage.initRoot<server::config::Worker::Module>();
+          decodeModuleResponse(body.kind, body.bytes, specifier, moduleBuilder);
+
+          // If the module fallback service returns a name in the module then it has to
+          // match the specifier we passed in. This is an optional sanity check.
+          if (moduleBuilder.getName() != specifier) {
+            KJ_LOG(ERROR,
+                "Fallback service failed to fetch module: returned module "
+                "name does not match specifier",
+                moduleBuilder.getName(), specifier);
+            return kj::none;
+          }
+
+          kj::Own<server::config::Worker::Module::Reader> ret =
+              capnp::clone(moduleBuilder.asReader());
+          return ModuleOrRedirect(kj::mv(ret));
+        }
+        KJ_CATCH(exception) {
+          KJ_LOG(ERROR, "Fallback service failed to fetch module", exception, specifier);
           return kj::none;
         }
-      } else {
-        moduleBuilder.setName(kj::str(specifier));
       }
-
-      kj::Own<server::config::Worker::Module::Reader> ret = capnp::clone(moduleBuilder.asReader());
-      return ModuleOrRedirect(kj::mv(ret));
     }
-    KJ_CATCH(exception) {
-      KJ_LOG(ERROR, "Fallback service failed to fetch module", exception, specifier);
-      return kj::none;
-    }
+    KJ_UNREACHABLE;
   }
 
-  // If we got here, no jsonPayload was received and we return nothing.
   return kj::none;
 }
 
@@ -166,8 +221,7 @@ void FallbackServiceClient::threadMain() {
 
       if (version == Version::V1) {
         // === V1: GET request with query parameters ===
-        kj::Maybe<kj::String> jsonPayload;
-        bool redirect = false;
+        RawResponse rawResponse;
         bool prefixed = false;
         kj::Url url;
         kj::StringPtr actualSpecifier = nullptr;
@@ -211,8 +265,7 @@ void FallbackServiceClient::threadMain() {
 
             if (resp.statusCode == 301) {
               KJ_IF_SOME(loc, resp.headers->get(kj::HttpHeaderId::LOCATION)) {
-                redirect = true;
-                jsonPayload = kj::str(loc);
+                rawResponse = Redirect{.location = kj::str(loc)};
               } else {
                 KJ_LOG(ERROR, "Fallback service returned a redirect with no location", spec);
               }
@@ -222,7 +275,7 @@ void FallbackServiceClient::threadMain() {
               auto payload = resp.body->readAllText().wait(io.waitScope);
               KJ_LOG(ERROR, "Fallback service failed to fetch module", payload, spec);
             } else {
-              jsonPayload = resp.body->readAllText().wait(io.waitScope);
+              rawResponse = readBody(resp, io.waitScope);
             }
             break;  // Success, no retry needed.
           }
@@ -235,7 +288,7 @@ void FallbackServiceClient::threadMain() {
           }
         }
 
-        result = handleReturnPayload(kj::mv(jsonPayload), redirect, actualSpecifier);
+        result = handleReturnPayload(kj::mv(rawResponse), actualSpecifier);
 
       } else {
         // === V2: POST request with JSON body ===
@@ -263,8 +316,7 @@ void FallbackServiceClient::threadMain() {
 
         auto payload = json.encode(requestMsg);
 
-        kj::Maybe<kj::String> jsonPayload;
-        bool redirect = false;
+        RawResponse rawResponse;
 
         // Retry once on disconnect (stale pooled connection).
         for (int attempt = 0; attempt < 2; attempt++) {
@@ -279,8 +331,7 @@ void FallbackServiceClient::threadMain() {
 
             if (resp.statusCode == 301) {
               KJ_IF_SOME(loc, resp.headers->get(kj::HttpHeaderId::LOCATION)) {
-                redirect = true;
-                jsonPayload = kj::str(loc);
+                rawResponse = Redirect{.location = kj::str(loc)};
               } else {
                 KJ_LOG(ERROR, "Fallback service returned a redirect with no location", specifier);
               }
@@ -290,7 +341,7 @@ void FallbackServiceClient::threadMain() {
               auto body = resp.body->readAllText().wait(io.waitScope);
               KJ_LOG(ERROR, "Fallback service failed to fetch module", body, specifier);
             } else {
-              jsonPayload = resp.body->readAllText().wait(io.waitScope);
+              rawResponse = readBody(resp, io.waitScope);
             }
             break;  // Success, no retry needed.
           }
@@ -303,7 +354,7 @@ void FallbackServiceClient::threadMain() {
           }
         }
 
-        result = handleReturnPayload(kj::mv(jsonPayload), redirect, specifier);
+        result = handleReturnPayload(kj::mv(rawResponse), specifier);
       }
 
       // Deliver the result to the calling thread.

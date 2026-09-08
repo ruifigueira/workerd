@@ -1144,7 +1144,10 @@ wd_test(
 wd_test(
     src = "worker-loader-async-startup-test.wd-test",
     args = ["--experimental"],
-    data = ["worker-loader-async-startup-test.js"],
+    data = [
+        "test.wasm",
+        "worker-loader-async-startup-test.js",
+    ],
 )
 
 wd_test(
