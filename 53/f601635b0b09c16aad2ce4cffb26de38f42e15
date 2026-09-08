@@ -1,0 +1,19 @@
+src/workerd/util/mimetype.h
+  s_3b94de117771b1::t_6dac2c40b4cd65 174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "53f601635b0b09c16aad2ce4cffb26de38f42e15",
+  "prompts": {},
+  "sessions": {
+    "s_3b94de117771b1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f86c3919effeBdKzL7Cxlr6FBS",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
