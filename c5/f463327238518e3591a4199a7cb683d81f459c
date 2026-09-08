@@ -1,0 +1,27 @@
+src/workerd/server/BUILD.bazel
+  s_7eef97e0968964::t_b419f159274fac 308-309
+src/workerd/server/fallback-service.c++
+  s_7eef97e0968964::t_5b6251b9574a95 3-4,16-52,67-87,89-114,116-121,126,224,268,278,291,319,334,344,357
+src/workerd/server/fallback-service.h
+  s_7eef97e0968964::t_a9bcbabae63986 6,31-33,58-79
+src/workerd/server/server.c++
+  s_7eef97e0968964::t_e238367109b624 5203-5206,5246,5251-5254
+src/workerd/server/tests/module-fallback/module-fallback-test.mjs
+  s_7eef97e0968964::t_cca380afbadd9d 56-61,97-109,190-195,301
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "c5f463327238518e3591a4199a7cb683d81f459c",
+  "prompts": {},
+  "sessions": {
+    "s_7eef97e0968964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f82c5b9b9ffeBdQCT0VqCU1A9F",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
