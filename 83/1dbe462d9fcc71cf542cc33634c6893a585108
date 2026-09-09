@@ -1,0 +1,19 @@
+src/workerd/jsg/modules-new.c++
+  s_7eef97e0968964::t_04d517aff081af 813-814
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "831dbe462d9fcc71cf542cc33634c6893a585108",
+  "prompts": {},
+  "sessions": {
+    "s_7eef97e0968964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f82c5b9b9ffeBdQCT0VqCU1A9F",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
