@@ -1,0 +1,21 @@
+src/workerd/jsg/modules-new-test.c++
+  s_7eef97e0968964::t_aa176db3d8085a 729-739,796-797
+src/workerd/jsg/script.h
+  s_7eef97e0968964::t_672d64c3f4a880 3,26-29
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "88e1744b268548a8a2d0f45ba50c3996b833bad9",
+  "prompts": {},
+  "sessions": {
+    "s_7eef97e0968964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f82c5b9b9ffeBdQCT0VqCU1A9F",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
