@@ -719,12 +719,6 @@ class ModuleBundle {
 // module namespace. Matches Node.js require() semantics.
 WD_STRONG_BOOL(UnwrapDefault);
 
-enum class MainModulePreparationResult {
-  READY,
-  NOT_FOUND,
-  FAILED,
-};
-
 struct AsyncResolveResult final {
   OwnedResolveContext context;
   ModuleBundle::Resolution resolution;
@@ -833,13 +827,11 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
       UnwrapDefault unwrapDefault = UnwrapDefault::NO,
       RequireEsm requireEsm = RequireEsm::NO);
 
+  // Resolves, instantiates, and evaluates the worker's main module, returning a promise for
+  // its namespace. When the registry has an asynchronous resolver, the main module and any
+  // missing static dependencies are fetched through it before instantiation. Returns kj::none
+  // when the module is not in the registry and no asynchronous resolver is configured.
   static kj::Maybe<Promise<Value>> tryResolveMainModuleAsync(Lock& js, kj::StringPtr specifier);
-
-  // Resolves and instantiates the main module without evaluating it. A failed instantiation leaves
-  // the JavaScript exception pending so the caller can either propagate it or retry after
-  // satisfying a deferred module fallback request.
-  static MainModulePreparationResult tryPrepareMainModule(
-      Lock& js, kj::StringPtr specifier) KJ_WARN_UNUSED_RESULT;
 
   kj::Maybe<Promise<AsyncResolveResult>> resolveAsync(
       Lock& js, OwnedResolveContext context) const KJ_WARN_UNUSED_RESULT;
@@ -867,6 +859,12 @@ class ModuleRegistry final: public kj::AtomicRefcounted, public ModuleRegistryBa
   // See Builder::Options::CANONICAL_FALLBACK_URLS.
   bool usesCanonicalFallbackUrls() const {
     return canonicalFallbackUrls;
+  }
+
+  // True when Builder::setAsyncResolveCallback() configured an asynchronous resolver, so a
+  // lookup miss may be satisfied by resolveAsync() and storeAsyncResolution().
+  bool supportsAsyncResolution() const {
+    return maybeAsyncResolveCallback != kj::none;
   }
 
  private:

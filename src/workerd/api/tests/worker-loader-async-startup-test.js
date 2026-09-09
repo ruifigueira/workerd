@@ -11,6 +11,22 @@ let moduleFallbackRequests = [];
 let activeModuleFallbackRequests = 0;
 let maxActiveModuleFallbackRequests = 0;
 
+// Holds a module fallback response open long enough for concurrent fetches to
+// overlap, and records how many were in flight at once.
+async function respondWithTrackedConcurrency(respond) {
+  ++activeModuleFallbackRequests;
+  maxActiveModuleFallbackRequests = Math.max(
+    maxActiveModuleFallbackRequests,
+    activeModuleFallbackRequests
+  );
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    return respond();
+  } finally {
+    --activeModuleFallbackRequests;
+  }
+}
+
 export class Outbound extends WorkerEntrypoint {
   async fetch(request) {
     if (request.method === 'POST') {
@@ -184,18 +200,117 @@ export class Outbound extends WorkerEntrypoint {
             headers: { 'content-type': 'application/octet-stream;foo=bar' },
           });
         case 'file:///bundle/concurrent-a.js':
-        case 'file:///bundle/concurrent-b.js': {
-          ++activeModuleFallbackRequests;
-          maxActiveModuleFallbackRequests = Math.max(
-            maxActiveModuleFallbackRequests,
-            activeModuleFallbackRequests
+        case 'file:///bundle/concurrent-b.js':
+          return respondWithTrackedConcurrency(() =>
+            Response.json({
+              esModule: `export default '${resolution.specifier.at(-4)}';`,
+            })
           );
-          await new Promise((resolve) => setTimeout(resolve, 10));
-          --activeModuleFallbackRequests;
+        case 'file:///bundle/fanout.js':
           return Response.json({
-            esModule: `export default '${resolution.specifier.at(-4)}';`,
+            esModule: `
+              import a from './fanout-a.js';
+              import b from './fanout-b.js';
+              import c from './fanout-c.js';
+              export default [a, b, c].join(':');
+            `,
           });
-        }
+        // The conditional-polyfill pattern: a module's top-level await gates on a
+        // dynamic import so that every importer waits for the polyfill. Two sibling
+        // consumers import the gate (the shape that trips WebKit).
+        case 'file:///bundle/polyfill-main.js':
+          return Response.json({
+            esModule: `
+              import result from './polyfill-entry.js';
+              export default {
+                fetch() {
+                  return new Response(result);
+                },
+              };
+            `,
+          });
+        case 'file:///bundle/polyfill-entry.js':
+          return Response.json({
+            esModule: `
+              import './polyfill-consumer-a.js';
+              import './polyfill-consumer-b.js';
+              import { polyfillLoaded } from './conditionally-load-polyfill.js';
+              export default [
+                polyfillLoaded,
+                globalThis.popoverPolyfilled,
+                globalThis.consumersSawPolyfill,
+              ].join(':');
+            `,
+          });
+        case 'file:///bundle/polyfill-consumer-a.js':
+        case 'file:///bundle/polyfill-consumer-b.js':
+          return Response.json({
+            esModule: `
+              import './conditionally-load-polyfill.js';
+              // Runs only once the gate's top-level await has settled.
+              globalThis.consumersSawPolyfill =
+                (globalThis.consumersSawPolyfill ?? 0) +
+                (globalThis.popoverPolyfilled ? 1 : 0);
+            `,
+          });
+        case 'file:///bundle/conditionally-load-polyfill.js':
+          return Response.json({
+            esModule: `
+              if (
+                typeof HTMLElement === 'undefined' ||
+                !('popover' in HTMLElement.prototype)
+              ) {
+                await import('./popover-polyfill.js');
+              }
+              export const polyfillLoaded = true;
+            `,
+          });
+        case 'file:///bundle/popover-polyfill.js':
+          return Response.json({
+            esModule: 'globalThis.popoverPolyfilled = true;',
+          });
+        case 'file:///bundle/fanout-main.js':
+          return Response.json({
+            esModule: `
+              import a from './fanout-a.js';
+              import b from './fanout-b.js';
+              import c from './fanout-c.js';
+              export default {
+                fetch() {
+                  return new Response([a, b, c].join(':'));
+                },
+              };
+            `,
+          });
+        case 'file:///bundle/fanout-a.js':
+          return respondWithTrackedConcurrency(() =>
+            Response.json({
+              esModule: `
+                import child from './fanout-a-child.js';
+                export default 'a-' + child;
+              `,
+            })
+          );
+        case 'file:///bundle/fanout-b.js':
+        case 'file:///bundle/fanout-c.js':
+          return respondWithTrackedConcurrency(() =>
+            Response.json({
+              esModule: `export default '${resolution.specifier.at(-4)}';`,
+            })
+          );
+        case 'file:///bundle/fanout-a-child.js':
+          return respondWithTrackedConcurrency(() =>
+            Response.json({ esModule: "export default 'child';" })
+          );
+        case 'file:///bundle/fanout-broken.js':
+          return Response.json({
+            esModule: `
+              import a from './fanout-a.js';
+              import missing from './fanout-missing.js';
+              import c from './fanout-c.js';
+              export default [a, missing, c].join(':');
+            `,
+          });
         default:
           return new Response('not found', { status: 404 });
       }
@@ -562,13 +677,19 @@ export const asyncStartupModuleFallback = {
 
     const response = await worker.getEntrypoint().fetch('https://example.com/');
     assert.strictEqual(await response.text(), 'fallback:42:true');
-    assert.deepStrictEqual(moduleFallbackRequests, [
-      {
-        type: 'internal',
-        specifier: 'file:///bundle/main.js',
-        rawSpecifier: 'main.js',
-        referrer: 'file:///bundle/',
-      },
+    assert.strictEqual(moduleFallbackRequests.length, 3);
+    assert.deepStrictEqual(moduleFallbackRequests[0], {
+      type: 'internal',
+      specifier: 'file:///bundle/main.js',
+      rawSpecifier: 'main.js',
+      referrer: 'file:///bundle/',
+    });
+    // The main module's two static imports are fetched as one batch, so their
+    // arrival order is not fixed.
+    const batch = moduleFallbackRequests
+      .slice(1)
+      .sort((left, right) => left.specifier.localeCompare(right.specifier));
+    assert.deepStrictEqual(batch, [
       {
         type: 'import',
         specifier: 'file:///bundle/message.js',
@@ -583,6 +704,59 @@ export const asyncStartupModuleFallback = {
         attributes: [{ name: 'type', value: 'json' }],
       },
     ]);
+  },
+};
+
+// The main module's static graph is fetched one level at a time, with every miss in a
+// level requested concurrently, the same way a runtime dynamic import fetches it.
+export const asyncStartupFetchesStaticGraphLevelsTogether = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    activeModuleFallbackRequests = 0;
+    maxActiveModuleFallbackRequests = 0;
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'fanout-main.js',
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'a-child:b:c');
+
+    // The main module, then its three imports as a batch, then the dependency one
+    // of them introduced. Every module is fetched exactly once.
+    assert.strictEqual(moduleFallbackRequests.length, 5);
+    assert.deepStrictEqual(moduleFallbackRequests[0], {
+      type: 'internal',
+      specifier: 'file:///bundle/fanout-main.js',
+      rawSpecifier: 'fanout-main.js',
+      referrer: 'file:///bundle/',
+    });
+    const batch = moduleFallbackRequests
+      .slice(1, 4)
+      .sort((left, right) => left.specifier.localeCompare(right.specifier));
+    assert.deepStrictEqual(
+      batch,
+      ['a', 'b', 'c'].map((name) => ({
+        type: 'import',
+        specifier: `file:///bundle/fanout-${name}.js`,
+        rawSpecifier: `./fanout-${name}.js`,
+        referrer: 'file:///bundle/fanout-main.js',
+      }))
+    );
+    assert.deepStrictEqual(moduleFallbackRequests[4], {
+      type: 'import',
+      specifier: 'file:///bundle/fanout-a-child.js',
+      rawSpecifier: './fanout-a-child.js',
+      referrer: 'file:///bundle/fanout-a.js',
+    });
+    assert.strictEqual(maxActiveModuleFallbackRequests, 3);
   },
 };
 
@@ -1013,6 +1187,202 @@ export const runtimeDynamicImportModuleFallback = {
       ['file:///bundle/concurrent-a.js', 'file:///bundle/concurrent-b.js']
     );
     assert.strictEqual(maxActiveModuleFallbackRequests, 2);
+  },
+};
+
+// A dynamically imported module's static dependencies are fetched together, one
+// graph level at a time, rather than one dependency per instantiation attempt.
+export const runtimeDynamicImportFetchesStaticGraphLevelsTogether = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    activeModuleFallbackRequests = 0;
+    maxActiveModuleFallbackRequests = 0;
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          export default {
+            async fetch() {
+              const { default: value } = await import('./fanout.js');
+              return new Response(value);
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'a-child:b:c');
+
+    // Every module is fetched exactly once: the root, then its three imports as a
+    // batch, then the dependency one of them introduced.
+    assert.strictEqual(moduleFallbackRequests.length, 5);
+    assert.strictEqual(
+      moduleFallbackRequests[0].specifier,
+      'file:///bundle/fanout.js'
+    );
+    // The batch is issued concurrently, so its arrival order is not fixed. Each
+    // entry carries the same referrer and raw specifier that instantiation
+    // would have reported for it.
+    const batch = moduleFallbackRequests
+      .slice(1, 4)
+      .sort((left, right) => left.specifier.localeCompare(right.specifier));
+    assert.deepStrictEqual(
+      batch,
+      ['a', 'b', 'c'].map((name) => ({
+        type: 'import',
+        specifier: `file:///bundle/fanout-${name}.js`,
+        rawSpecifier: `./fanout-${name}.js`,
+        referrer: 'file:///bundle/fanout.js',
+      }))
+    );
+    assert.deepStrictEqual(moduleFallbackRequests[4], {
+      type: 'import',
+      specifier: 'file:///bundle/fanout-a-child.js',
+      rawSpecifier: './fanout-a-child.js',
+      referrer: 'file:///bundle/fanout-a.js',
+    });
+    assert.strictEqual(maxActiveModuleFallbackRequests, 3);
+  },
+};
+
+const POLYFILL_GRAPH_FLAGS = [
+  'allow_insecure_inefficient_logged_eval',
+  'dynamic_worker_async_startup',
+  'new_module_registry',
+];
+
+// The polyfill graph, every module served by the fallback:
+//
+//   entry -> consumer-a -> conditionally-load-polyfill --(top-level await import)--> popover-polyfill
+//         -> consumer-b -> conditionally-load-polyfill
+//         -> conditionally-load-polyfill
+//
+// The static part is fetched one level at a time; the polyfill itself is fetched by
+// the dynamic import inside the gate's top-level await, after the graph has started
+// evaluating. Both consumers observe the polyfill because their bodies run only after
+// the gate settles.
+function assertPolyfillGraphFetched(requests) {
+  assert.deepStrictEqual(requests.slice(0, 3).sort(), [
+    'file:///bundle/conditionally-load-polyfill.js',
+    'file:///bundle/polyfill-consumer-a.js',
+    'file:///bundle/polyfill-consumer-b.js',
+  ]);
+  assert.deepStrictEqual(requests.slice(3), [
+    'file:///bundle/popover-polyfill.js',
+  ]);
+}
+
+export const asyncStartupConditionalPolyfill = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: POLYFILL_GRAPH_FLAGS,
+      mainModule: 'polyfill-main.js',
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'true:true:2');
+
+    const requests = moduleFallbackRequests.map(({ specifier }) => specifier);
+    assert.deepStrictEqual(requests.slice(0, 2), [
+      'file:///bundle/polyfill-main.js',
+      'file:///bundle/polyfill-entry.js',
+    ]);
+    assertPolyfillGraphFetched(requests.slice(2));
+  },
+};
+
+export const runtimeDynamicImportConditionalPolyfill = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: POLYFILL_GRAPH_FLAGS,
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          export default {
+            async fetch() {
+              return new Response((await import('./polyfill-entry.js')).default);
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'true:true:2');
+
+    const requests = moduleFallbackRequests.map(({ specifier }) => specifier);
+    assert.deepStrictEqual(requests.slice(0, 1), [
+      'file:///bundle/polyfill-entry.js',
+    ]);
+    assertPolyfillGraphFetched(requests.slice(1));
+  },
+};
+
+// When one fetch in a batch fails, the import rejects with that failure and the
+// other fetches in the batch are still issued exactly once.
+export const runtimeDynamicImportRejectsWhenBatchedFetchFails = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          export default {
+            async fetch() {
+              try {
+                await import('./fanout-broken.js');
+                return new Response('unexpected-success');
+              } catch (error) {
+                // The sibling fetches are still in flight when the import rejects.
+                // Let them finish so the test can observe the complete request set.
+                await new Promise((resolve) => setTimeout(resolve, 50));
+                return new Response(error.message);
+              }
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.match(
+      await response.text(),
+      /Dynamic module fallback failed for file:\/\/\/bundle\/fanout-missing\.js with status 404/
+    );
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier).sort(),
+      [
+        'file:///bundle/fanout-a.js',
+        'file:///bundle/fanout-broken.js',
+        'file:///bundle/fanout-c.js',
+        'file:///bundle/fanout-missing.js',
+      ]
+    );
   },
 };
 

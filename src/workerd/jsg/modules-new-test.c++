@@ -3596,6 +3596,297 @@ KJ_TEST("Only lookups that consult the fallback report an unresolved specifier")
   KJ_ASSERT(lookup(ResolveContext::Type::PUBLIC_BUILTIN).unresolvedSpecifier == kj::none);
 }
 
+KJ_TEST("Dynamic import fetches missing static dependencies together") {
+  // The graph below is served entirely by the asynchronous resolver:
+  //
+  //   root.js -> a.js -> a-child.js
+  //           -> b.js
+  //           -> c.js
+  //
+  // Static imports resolve synchronously inside V8's InstantiateModule(), so the
+  // registry scans each fetched module's requests before instantiating and fetches
+  // every miss at once. The resolver here never settles a fetch on its own, which
+  // makes the batching observable: after root.js arrives, a.js, b.js, and c.js
+  // must all be requested before any of them is fulfilled.
+  PREAMBLE([&](Lock& js) {
+    CompilationObserver compilationObserver;
+
+    // Sources must outlive the modules that reference them.
+    auto rootSource = kj::str("import a from './a.js';\n"
+                              "import b from './b.js';\n"
+                              "import c from './c.js';\n"
+                              "export default a + b + c;\n");
+    auto aSource = kj::str("import child from './a-child.js'; export default 'a' + child;");
+    auto aChildSource = kj::str("export default '-child:';");
+    auto bSource = kj::str("export default 'b:';");
+    auto cSource = kj::str("export default 'c';");
+
+    struct PendingFetch {
+      modules::OwnedResolveContext context;
+      Promise<modules::AsyncResolveResult>::Resolver resolver;
+    };
+    kj::Vector<kj::String> requested;
+    kj::Vector<PendingFetch> pending;
+
+    auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                        .setAsyncResolveCallback([&](Lock& js, modules::OwnedResolveContext context)
+                                                     -> Promise<modules::AsyncResolveResult> {
+      requested.add(kj::str(context.normalizedSpecifier.getHref()));
+      auto [promise, resolver] = js.newPromiseAndResolver<modules::AsyncResolveResult>();
+      pending.add(PendingFetch{
+        .context = kj::mv(context),
+        .resolver = kj::mv(resolver),
+      });
+      return kj::mv(promise);
+    }).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    auto sourceFor = [&](kj::ArrayPtr<const char> href) -> kj::StringPtr {
+      if (href == "file:///root.js"_kj) return rootSource;
+      if (href == "file:///a.js"_kj) return aSource;
+      if (href == "file:///a-child.js"_kj) return aChildSource;
+      if (href == "file:///b.js"_kj) return bSource;
+      if (href == "file:///c.js"_kj) return cSource;
+      KJ_FAIL_ASSERT("unexpected fetch", href);
+    };
+
+    // Checks that exactly the expected fetches are pending, in order, then fulfills
+    // each one with the source for its specifier.
+    auto fulfillPending = [&](std::initializer_list<kj::StringPtr> expected) {
+      KJ_ASSERT(pending.size() == expected.size(), pending.size());
+      size_t i = 0;
+      for (auto href: expected) {
+        KJ_ASSERT(pending[i].context.normalizedSpecifier.getHref() == href,
+            pending[i].context.normalizedSpecifier.getHref(), href);
+        i++;
+      }
+      auto fetches = kj::mv(pending);
+      pending = kj::Vector<PendingFetch>();
+      for (auto& fetch: fetches) {
+        auto url = fetch.context.normalizedSpecifier.clone();
+        auto source = sourceFor(url.getHref());
+        fetch.resolver.resolve(js,
+            modules::AsyncResolveResult{
+              .context = kj::mv(fetch.context),
+              .resolution = Module::newEsm(kj::mv(url), Module::Type::FALLBACK, source),
+            });
+      }
+    };
+
+    JSG_TRY(js) {
+      auto fn = Module::compileEvalFunction(js, "globalThis.result = import('./root.js');"_kj,
+          "file:///entry.js"_kj, kj::none, compilationObserver);
+      fn(js);
+
+      // The imported module itself is missing.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 1);
+      fulfillPending({"file:///root.js"});
+
+      // root.js compiles, and all three of its static imports are requested in one
+      // batch before instantiation is attempted.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 4, requested.size());
+      fulfillPending({"file:///a.js", "file:///b.js", "file:///c.js"});
+
+      // The rescan finds the dependency a.js introduced.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 5, requested.size());
+      fulfillPending({"file:///a-child.js"});
+
+      // The graph is complete: it instantiates and evaluates.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 5, requested.size());
+      auto result = JsObject(js.v8Context()->Global()).get(js, "result");
+      auto promise = v8::Local<v8::Value>(result).As<v8::Promise>();
+      KJ_ASSERT(promise->State() == v8::Promise::kFulfilled);
+      auto ns = JsObject(promise->Result().As<v8::Object>());
+      KJ_ASSERT(kj::str(ns.get(js, "default")) == "a-child:b:c");
+    }
+    JSG_CATCH(exception) {
+      js.throwException(kj::mv(exception));
+    }
+  });
+}
+
+KJ_TEST("Dynamic import rejects when one fetch of a batch fails") {
+  // root.js statically imports a.js and b.js, both missing. b.js fails to fetch; the
+  // import must reject with that failure, and the batch must settle even though a.js
+  // arrives afterwards.
+  PREAMBLE([&](Lock& js) {
+    CompilationObserver compilationObserver;
+
+    auto rootSource =
+        kj::str("import a from './a.js'; import b from './b.js'; export default a + b;");
+    auto aSource = kj::str("export default 'a';");
+
+    struct PendingFetch {
+      modules::OwnedResolveContext context;
+      Promise<modules::AsyncResolveResult>::Resolver resolver;
+    };
+    kj::Vector<PendingFetch> pending;
+
+    auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                        .setAsyncResolveCallback([&](Lock& js, modules::OwnedResolveContext context)
+                                                     -> Promise<modules::AsyncResolveResult> {
+      auto [promise, resolver] = js.newPromiseAndResolver<modules::AsyncResolveResult>();
+      pending.add(PendingFetch{
+        .context = kj::mv(context),
+        .resolver = kj::mv(resolver),
+      });
+      return kj::mv(promise);
+    }).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    auto fulfill = [&](PendingFetch& fetch, kj::StringPtr source) {
+      auto url = fetch.context.normalizedSpecifier.clone();
+      fetch.resolver.resolve(js,
+          modules::AsyncResolveResult{
+            .context = kj::mv(fetch.context),
+            .resolution = Module::newEsm(kj::mv(url), Module::Type::FALLBACK, source),
+          });
+    };
+
+    JSG_TRY(js) {
+      auto fn = Module::compileEvalFunction(js,
+          "globalThis.result = import('./root.js'); globalThis.result.catch(() => {});"_kj,
+          "file:///entry.js"_kj, kj::none, compilationObserver);
+      fn(js);
+
+      js.runMicrotasks();
+      KJ_ASSERT(pending.size() == 1);
+      auto rootFetch = kj::mv(pending[0]);
+      pending.clear();
+      fulfill(rootFetch, rootSource);
+
+      // Both dependencies are requested together. Fail b.js first, then deliver a.js.
+      js.runMicrotasks();
+      KJ_ASSERT(pending.size() == 2, pending.size());
+      KJ_ASSERT(pending[0].context.normalizedSpecifier.getHref() == "file:///a.js"_kj);
+      KJ_ASSERT(pending[1].context.normalizedSpecifier.getHref() == "file:///b.js"_kj);
+      pending[1].resolver.reject(js, js.error("fetch failed for b.js"_kj));
+      js.runMicrotasks();
+      fulfill(pending[0], aSource);
+      pending.clear();
+      js.runMicrotasks();
+
+      auto result = JsObject(js.v8Context()->Global()).get(js, "result");
+      auto promise = v8::Local<v8::Value>(result).As<v8::Promise>();
+      KJ_ASSERT(promise->State() == v8::Promise::kRejected);
+      auto err = kj::str(JsValue(promise->Result()));
+      KJ_ASSERT(err == "Error: fetch failed for b.js", err);
+      // Nothing was re-requested after the failure.
+      KJ_ASSERT(pending.size() == 0, pending.size());
+    }
+    JSG_CATCH(exception) {
+      js.throwException(kj::mv(exception));
+    }
+  });
+}
+
+KJ_TEST("Main module evaluation fetches missing static dependencies together") {
+  // The same graph as the dynamic import test above, but reached through the
+  // worker's main module. Nothing is in the registry, so the main module itself is
+  // the first fetch; its static imports are then fetched as one batch.
+  //
+  //   main.js -> a.js -> a-child.js
+  //           -> b.js
+  //           -> c.js
+  PREAMBLE([&](Lock& js) {
+    CompilationObserver compilationObserver;
+
+    auto mainSource = kj::str("import a from './a.js';\n"
+                              "import b from './b.js';\n"
+                              "import c from './c.js';\n"
+                              "export default a + b + c;\n");
+    auto aSource = kj::str("import child from './a-child.js'; export default 'a' + child;");
+    auto aChildSource = kj::str("export default '-child:';");
+    auto bSource = kj::str("export default 'b:';");
+    auto cSource = kj::str("export default 'c';");
+
+    struct PendingFetch {
+      modules::OwnedResolveContext context;
+      Promise<modules::AsyncResolveResult>::Resolver resolver;
+    };
+    kj::Vector<kj::String> requested;
+    kj::Vector<PendingFetch> pending;
+
+    auto registry = ModuleRegistry::Builder(BASE, ModuleRegistry::Builder::Options::ALLOW_FALLBACK)
+                        .setAsyncResolveCallback([&](Lock& js, modules::OwnedResolveContext context)
+                                                     -> Promise<modules::AsyncResolveResult> {
+      requested.add(kj::str(context.normalizedSpecifier.getHref()));
+      auto [promise, resolver] = js.newPromiseAndResolver<modules::AsyncResolveResult>();
+      pending.add(PendingFetch{
+        .context = kj::mv(context),
+        .resolver = kj::mv(resolver),
+      });
+      return kj::mv(promise);
+    }).finish();
+    auto attached = registry->attachToIsolate(js, compilationObserver);
+
+    auto sourceFor = [&](kj::ArrayPtr<const char> href) -> kj::StringPtr {
+      if (href == "file:///main.js"_kj) return mainSource;
+      if (href == "file:///a.js"_kj) return aSource;
+      if (href == "file:///a-child.js"_kj) return aChildSource;
+      if (href == "file:///b.js"_kj) return bSource;
+      if (href == "file:///c.js"_kj) return cSource;
+      KJ_FAIL_ASSERT("unexpected fetch", href);
+    };
+
+    auto fulfillPending = [&](std::initializer_list<kj::StringPtr> expected) {
+      KJ_ASSERT(pending.size() == expected.size(), pending.size());
+      size_t i = 0;
+      for (auto href: expected) {
+        KJ_ASSERT(pending[i].context.normalizedSpecifier.getHref() == href,
+            pending[i].context.normalizedSpecifier.getHref(), href);
+        i++;
+      }
+      auto fetches = kj::mv(pending);
+      pending = kj::Vector<PendingFetch>();
+      for (auto& fetch: fetches) {
+        auto url = fetch.context.normalizedSpecifier.clone();
+        auto source = sourceFor(url.getHref());
+        fetch.resolver.resolve(js,
+            modules::AsyncResolveResult{
+              .context = kj::mv(fetch.context),
+              .resolution = Module::newEsm(kj::mv(url), Module::Type::FALLBACK, source),
+            });
+      }
+    };
+
+    JSG_TRY(js) {
+      auto promise = KJ_ASSERT_NONNULL(ModuleRegistry::tryResolveMainModuleAsync(js, "main.js"_kj))
+                         .consumeHandle(js);
+
+      // The main module itself is missing and is requested with the INTERNAL source.
+      KJ_ASSERT(requested.size() == 1, requested.size());
+      KJ_ASSERT(pending[0].context.source == modules::ResolveContext::Source::INTERNAL);
+      fulfillPending({"file:///main.js"});
+
+      // main.js compiles, and all three of its static imports are requested in one
+      // batch before instantiation is attempted.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 4, requested.size());
+      fulfillPending({"file:///a.js", "file:///b.js", "file:///c.js"});
+
+      // The rescan finds the dependency a.js introduced.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 5, requested.size());
+      fulfillPending({"file:///a-child.js"});
+
+      // The graph is complete: it instantiates and evaluates to the namespace.
+      js.runMicrotasks();
+      KJ_ASSERT(requested.size() == 5, requested.size());
+      KJ_ASSERT(promise->State() == v8::Promise::kFulfilled);
+      auto ns = JsObject(promise->Result().As<v8::Object>());
+      KJ_ASSERT(kj::str(ns.get(js, "default")) == "a-child:b:c");
+    }
+    JSG_CATCH(exception) {
+      js.throwException(kj::mv(exception));
+    }
+  });
+}
+
 // ======================================================================================
 
 KJ_TEST("Dynamic import from a redirected fallback module works") {

@@ -956,7 +956,6 @@ kj::Arc<jsg::modules::ModuleRegistry> WorkerdApi::newWorkerdModuleRegistry(
     const jsg::Url& bundleBase,
     capnp::List<config::Extension>::Reader extensions,
     kj::Maybe<kj::String> maybeFallbackService,
-    kj::Maybe<NewModuleFallbackCallback> dynamicFallback,
     kj::Maybe<NewModuleAsyncFallbackCallback> dynamicAsyncFallback,
     kj::Maybe<kj::Own<api::pyodide::ArtifactBundler_State>> artifacts) {
 
@@ -964,7 +963,7 @@ kj::Arc<jsg::modules::ModuleRegistry> WorkerdApi::newWorkerdModuleRegistry(
   // service keeps the original fallback protocol.
   using Options = jsg::modules::ModuleRegistry::Builder::Options;
   auto options = Options::ALLOW_FALLBACK;
-  if (dynamicFallback != kj::none || dynamicAsyncFallback != kj::none) {
+  if (dynamicAsyncFallback != kj::none) {
     options = options | Options::CANONICAL_FALLBACK_URLS;
   }
 
@@ -1153,10 +1152,6 @@ kj::Arc<jsg::modules::ModuleRegistry> WorkerdApi::newWorkerdModuleRegistry(
       }));
     }
 
-    KJ_IF_SOME(callback, dynamicFallback) {
-      builder.add(jsg::modules::ModuleBundle::newFallbackBundle(
-          kj::mv(callback), jsg::modules::SupportsRequire::NO));
-    }
     KJ_IF_SOME(callback, dynamicAsyncFallback) {
       builder.setAsyncResolveCallback(kj::mv(callback));
     }

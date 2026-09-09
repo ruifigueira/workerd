@@ -760,11 +760,10 @@ class Worker::Lock {
   void validateHandlers(ValidationErrorReporter& errorReporter);
 
   // Evaluates a modular worker whose constructor deferred main-module evaluation. The caller must
-  // run this inside the worker's active IoContext.
+  // run this inside the worker's active IoContext. With the new module registry, this also
+  // fetches the main module and its missing static dependencies through the registry's
+  // asynchronous resolver when one is configured.
   jsg::Promise<void> evaluateDeferredModule();
-
-  // Resolves and instantiates a deferred main module without evaluating it.
-  jsg::modules::MainModulePreparationResult prepareDeferredModule() KJ_WARN_UNUSED_RESULT;
 
   // Get the ExportedHandler exported under the given name. `entrypointName` may be null to get the
   // default handler. Returns null if this is not a modules-syntax worker (but `entrypointName`

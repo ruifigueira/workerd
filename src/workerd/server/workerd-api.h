@@ -335,8 +335,9 @@ class WorkerdApi final: public Worker::Api {
       const CompatibilityFlags::Reader& featureFlags,
       jsg::modules::Module::Flags moduleFlags = jsg::modules::Module::Flags::NONE);
 
-  // Create the ModuleRegistry instance for the worker.
-  using NewModuleFallbackCallback = jsg::modules::ModuleBundle::Builder::ResolveCallback;
+  // Create the ModuleRegistry instance for the worker. `dynamicAsyncFallback` is the dynamic
+  // Worker module fallback: it resolves modules the bundle lacks through the loaded Worker's
+  // globalOutbound, for both the startup static-import graph and runtime dynamic imports.
   using NewModuleAsyncFallbackCallback = jsg::modules::ModuleRegistry::AsyncResolveCallback;
   static kj::Arc<jsg::modules::ModuleRegistry> newWorkerdModuleRegistry(
       kj::Maybe<const Worker::Script::ModulesSource&> source,
@@ -345,7 +346,6 @@ class WorkerdApi final: public Worker::Api {
       const jsg::Url& bundleBase,
       capnp::List<config::Extension>::Reader extensions,
       kj::Maybe<kj::String> fallbackService = kj::none,
-      kj::Maybe<NewModuleFallbackCallback> dynamicFallback = kj::none,
       kj::Maybe<NewModuleAsyncFallbackCallback> dynamicAsyncFallback = kj::none,
       kj::Maybe<kj::Own<api::pyodide::ArtifactBundler_State>> artifacts = kj::none);
 

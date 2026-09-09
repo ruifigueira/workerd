@@ -12,7 +12,9 @@
 #include <simdutf.h>
 
 #include <kj/encoding.h>
+#include <kj/map.h>
 #include <kj/mutex.h>
+#include <kj/refcount.h>
 #include <kj/table.h>
 
 #include <span>
@@ -689,17 +691,21 @@ class IsolateModuleRegistry final {
       Lock& js, const ModuleRegistry& registry, const CompilationObserver& observer);
   KJ_DISALLOW_COPY_AND_MOVE(IsolateModuleRegistry);
 
-  // Used to implement the normal static import of modules (using `import ... from`).
-  // Returns the v8::Module descriptor. If an empty v8::MaybeLocal is returned, then
-  // an exception has been scheduled with the isolate.
-  v8::MaybeLocal<v8::Module> resolve(Lock& js, const ResolveContext& context) {
+  // Resolves a static import without failing when the module is missing. The lookup
+  // order is the cached resolution, the registry, and finally the node:process
+  // redirect. When the result is kj::none and the miss is one an asynchronous
+  // resolver could satisfy, lastUnresolvedContext describes it; otherwise it is
+  // kj::none.
+  kj::Maybe<Entry&> tryResolveStatic(Lock& js, const ResolveContext& context) {
+    lastUnresolvedContext = kj::none;
+
     // Do we already have a cached module for this context?
     KJ_IF_SOME(found, findResolved(context)) {
-      return found.key.getHandle(js);
+      return found;
     }
     // No? That's OK, let's look it up.
     KJ_IF_SOME(found, resolveWithCaching(js, context)) {
-      return found.key.getHandle(js);
+      return found;
     }
 
     // Nothing resolved it through the ordinary bundle/builtin search — e.g. no
@@ -721,16 +727,249 @@ class IsolateModuleRegistry final {
           .rawSpecifier = processSpec.asPtr(),
         };
         KJ_IF_SOME(found, findResolved(processContext)) {
-          return found.key.getHandle(js);
+          // The bundle-level miss above is not a fallback candidate once the
+          // redirect resolves it.
+          lastUnresolvedContext = kj::none;
+          return found;
         }
         KJ_IF_SOME(found, resolveWithCaching(js, processContext)) {
-          return found.key.getHandle(js);
+          lastUnresolvedContext = kj::none;
+          return found;
         }
       }
     }
 
+    return kj::none;
+  }
+
+  // Used to implement the normal static import of modules (using `import ... from`).
+  // Returns the v8::Module descriptor. If an empty v8::MaybeLocal is returned, then
+  // an exception has been scheduled with the isolate.
+  v8::MaybeLocal<v8::Module> resolve(Lock& js, const ResolveContext& context) {
+    KJ_IF_SOME(found, tryResolveStatic(js, context)) {
+      return found.key.getHandle(js);
+    }
+
     // Nothing found? Aw... fail!
     JSG_FAIL_REQUIRE(Error, kj::str("Module not found: ", context.normalizedSpecifier.getHref()));
+  }
+
+  // Finds the static imports the registry cannot currently resolve, starting from
+  // `root` and following every already-resolvable ES module dependency that is not
+  // yet instantiated. Modules compile here exactly once, as they would during
+  // instantiation; the difference is that a miss records its resolve context
+  // instead of failing the whole graph. Each miss is reported once.
+  kj::Vector<OwnedResolveContext> collectMissingStaticImports(
+      Lock& js, v8::Local<v8::Module> root) {
+    kj::Vector<OwnedResolveContext> misses;
+    kj::HashSet<kj::String> missKeys;
+    kj::HashSet<HashableV8Ref<v8::Module>> visited;
+    v8::LocalVector<v8::Module> pending(js.v8Isolate);
+    visited.insert(HashableV8Ref<v8::Module>(js.v8Isolate, root));
+    pending.push_back(root);
+
+    while (!pending.empty()) {
+      auto module = pending.back();
+      pending.pop_back();
+      if (!module->IsSourceTextModule() || module->GetStatus() != v8::Module::kUninstantiated) {
+        continue;
+      }
+
+      // Resolving a child may rehash the instantiation table, so copy what the
+      // requests need out of the entry before resolving any of them.
+      Url referrerUrl = nullptr;
+      ResolveContext::Type type = ResolveContext::Type::BUNDLE;
+      KJ_IF_SOME(entry, lookup(js, module)) {
+        referrerUrl = getReferrerUrl(entry).clone();
+        type = entry.resolveType;
+      } else {
+        continue;
+      }
+
+      auto requests = module->GetModuleRequests();
+      for (int i = 0; i < requests->Length(); i++) {
+        auto request = requests->Get(i).As<v8::ModuleRequest>();
+        auto spec = js.toString(request->GetSpecifier());
+        auto importType =
+            parseImportAttributes(js, request->GetImportAttributes(), AttributeStride::TRIPLES);
+        if (isNodeJsCompatEnabled(js)) {
+          KJ_IF_SOME(nodeSpec, checkNodeSpecifier(spec)) {
+            spec = kj::mv(nodeSpec);
+          }
+        }
+        // Instantiation reports malformed specifiers; there is nothing to fetch.
+        auto url = KJ_UNWRAP_OR(referrerUrl.tryResolve(spec), continue);
+        auto normalized = url.clone(Url::EquivalenceOption::NORMALIZE_PATH);
+        ResolveContext context = {
+          .type = type,
+          .source = ResolveContext::Source::STATIC_IMPORT,
+          .normalizedSpecifier = normalized,
+          .referrerNormalizedSpecifier = referrerUrl,
+          .rawSpecifier = spec.asPtr(),
+          .importType = importType,
+        };
+
+        KJ_IF_SOME(found, tryResolveStatic(js, context)) {
+          auto child = found.key.getHandle(js);
+          HashableV8Ref<v8::Module> childRef(js.v8Isolate, child);
+          if (visited.find(childRef) == kj::none) {
+            visited.insert(kj::mv(childRef));
+            pending.push_back(child);
+          }
+          continue;
+        }
+        KJ_IF_SOME(unresolved, lastUnresolvedContext) {
+          // The fallback bundle stores results by URL, so that is the identity of a
+          // miss here too.
+          auto key = kj::str(unresolved.normalizedSpecifier.getHref());
+          if (missKeys.find(key) == kj::none) {
+            missKeys.insert(kj::mv(key));
+            misses.add(kj::mv(unresolved));
+          }
+          lastUnresolvedContext = kj::none;
+        }
+      }
+    }
+    return misses;
+  }
+
+  // Fetches every miss through the asynchronous resolver at the same time and stores
+  // each result in the fallback bundle as it arrives. The promise resolves once every
+  // result is stored and rejects with the first failure.
+  Promise<void> fetchMissingModules(Lock& js, kj::Vector<OwnedResolveContext> misses) {
+    struct Join final: public kj::Refcounted {
+      Join(size_t remaining, Promise<void>::Resolver resolver)
+          : remaining(remaining),
+            resolver(kj::mv(resolver)) {}
+
+      void fail(Lock& js, Value error) {
+        if (!failed) {
+          failed = true;
+          resolver.reject(js, error.getHandle(js));
+        }
+      }
+
+      void finishOne(Lock& js) {
+        if (--remaining == 0 && !failed) {
+          resolver.resolve(js);
+        }
+      }
+
+      size_t remaining;
+      bool failed = false;
+      Promise<void>::Resolver resolver;
+    };
+
+    // Start every fetch before attaching any continuation: a resolver that throws
+    // (for example when it enforces a request budget) then fails this import before
+    // the join holds any outstanding count, instead of leaving it settled never.
+    kj::Vector<Promise<AsyncResolveResult>> fetches(misses.size());
+    for (auto& miss: misses) {
+      fetches.add(KJ_ASSERT_NONNULL(inner.resolveAsync(js, kj::mv(miss)),
+          "prefetch requires a registry with an asynchronous resolver"));
+    }
+
+    auto [promise, resolver] = js.newPromiseAndResolver<void>();
+    auto join = kj::rc<Join>(fetches.size(), kj::mv(resolver));
+    for (auto& fetch: fetches) {
+      fetch.then(js, [join = join.addRef()](Lock& js, AsyncResolveResult result) mutable {
+        js.tryCatch([&] {
+          auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
+          registry.inner.storeAsyncResolution(
+              result.context.asResolveContext(), kj::mv(result.resolution));
+        }, [&](Value error) { join->fail(js, kj::mv(error)); });
+        join->finishOne(js);
+      }, [join = join.addRef()](Lock& js, Value error) mutable {
+        join->fail(js, kj::mv(error));
+        join->finishOne(js);
+      });
+    }
+    return kj::mv(promise);
+  }
+
+  // If the most recent lookup left a miss the asynchronous resolver could satisfy,
+  // fetches it, stores the result in the registry, and calls `restart` to start the
+  // operation over. Returns kj::none when there is no such miss or no asynchronous
+  // resolver.
+  template <typename Restart>
+  kj::Maybe<Promise<Value>> retryAfterAsyncResolution(Lock& js, Restart restart) {
+    KJ_IF_SOME(unresolved, lastUnresolvedContext) {
+      auto unresolvedContext = kj::mv(unresolved);
+      lastUnresolvedContext = kj::none;
+      KJ_IF_SOME(resolution, inner.resolveAsync(js, kj::mv(unresolvedContext))) {
+        return kj::mv(resolution)
+            .then(js,
+                [restart = kj::mv(restart)](
+                    Lock& js, AsyncResolveResult result) mutable -> Promise<Value> {
+          auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
+          registry.inner.storeAsyncResolution(
+              result.context.asResolveContext(), kj::mv(result.resolution));
+          return restart(js);
+        });
+      }
+    }
+    return kj::none;
+  }
+
+  // Instantiates `module` if it is not yet instantiated. When the registry has an
+  // asynchronous resolver and the module's static dependency graph has misses,
+  // returns a promise that fetches them and calls `restart` to start the operation
+  // over; the restarted pass rescans for dependencies the fetched modules introduce.
+  // Returns kj::none once the module is instantiated. Throws when instantiation
+  // fails for a reason the resolver cannot satisfy.
+  template <typename Restart>
+  kj::Maybe<Promise<Value>> instantiateOrFetchMissing(Lock& js,
+      v8::Local<v8::Module> module,
+      const Module& moduleDef,
+      kj::StringPtr failureMessage,
+      Restart restart) {
+    if (module->GetStatus() != v8::Module::kUninstantiated) {
+      return kj::none;
+    }
+
+    // V8 resolves static imports synchronously inside InstantiateModule(), so
+    // every module in the graph must already be in the registry. Find the
+    // missing ones first, fetch them together, and start over; the rescan on the
+    // next pass picks up dependencies the fetched modules add. The scan resolves
+    // each edge once more than instantiation alone would, against the resolution
+    // cache; that is cheap next to one fetch round trip.
+    if (moduleDef.isEsm() && inner.supportsAsyncResolution()) {
+      auto misses = collectMissingStaticImports(js, module);
+      if (misses.size() > 0) {
+        return fetchMissingModules(js, kj::mv(misses))
+            .then(js, [restart = kj::mv(restart)](Lock& js) mutable -> Promise<Value> {
+          return restart(js);
+        });
+      }
+    }
+
+    // Instantiation may still report a miss the prefetch did not predict. Fetch
+    // that one dependency and retry.
+    v8::TryCatch catcher(js.v8Isolate);
+    if (!moduleDef.instantiate(js, module, getObserver())) {
+      KJ_IF_SOME(retry, retryAfterAsyncResolution(js, kj::mv(restart))) {
+        catcher.Reset();
+        return kj::mv(retry);
+      }
+      if (catcher.HasCaught()) {
+        catcher.ReThrow();
+        throw JsExceptionThrown();
+      }
+      JSG_FAIL_REQUIRE(Error, failureMessage);
+    }
+    return kj::none;
+  }
+
+  // Starts the dynamic import described by `retryContext` over from the beginning.
+  // Used after asynchronously fetched modules have been stored in the registry.
+  static Promise<Value> restartDynamicImport(
+      Lock& js, const OwnedResolveContext& retryContext, SourcePhase sourcePhase) {
+    auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
+    auto retry = retryContext.asResolveContext();
+    auto promise = check(registry.dynamicResolve(js, retry.normalizedSpecifier.clone(),
+        retry.referrerNormalizedSpecifier.clone(), retry.type,
+        KJ_ASSERT_NONNULL(retry.rawSpecifier), sourcePhase, retry.importType));
+    return js.toPromise(promise);
   }
 
   // Used to implement the async dynamic import of modules (using `await import(...)`)
@@ -768,28 +1007,11 @@ class IsolateModuleRegistry final {
       };
       lastUnresolvedContext = kj::none;
 
-      auto retryAfterAsyncResolution = [&]() -> kj::Maybe<Promise<Value>> {
-        KJ_IF_SOME(unresolved, lastUnresolvedContext) {
-          auto unresolvedContext = kj::mv(unresolved);
-          lastUnresolvedContext = kj::none;
-          KJ_IF_SOME(resolution, inner.resolveAsync(js, kj::mv(unresolvedContext))) {
-            return kj::mv(resolution)
-                .then(js,
-                    [retryContext = OwnedResolveContext(context), sourcePhase](
-                        Lock& js, AsyncResolveResult result) mutable -> Promise<Value> {
-              auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
-              auto resolvedContext = result.context.asResolveContext();
-              registry.inner.storeAsyncResolution(resolvedContext, kj::mv(result.resolution));
-
-              auto retry = retryContext.asResolveContext();
-              auto promise = check(registry.dynamicResolve(js, retry.normalizedSpecifier.clone(),
-                  retry.referrerNormalizedSpecifier.clone(), retry.type,
-                  KJ_ASSERT_NONNULL(retry.rawSpecifier), sourcePhase, retry.importType));
-              return js.toPromise(promise);
-            });
-          }
-        }
-        return kj::none;
+      auto makeRestart = [&]() {
+        return
+            [retryContext = OwnedResolveContext(context), sourcePhase](Lock& js) -> Promise<Value> {
+          return restartDynamicImport(js, retryContext, sourcePhase);
+        };
       };
 
       auto handleFoundModule = [&](Entry& found) -> Promise<Value> {
@@ -805,19 +1027,10 @@ class IsolateModuleRegistry final {
           return js.rejectedPromise<Value>(v8Module->GetException());
         }
 
-        if (v8Module->GetStatus() == v8::Module::kUninstantiated) {
-          v8::TryCatch catcher(js.v8Isolate);
-          if (!moduleDef.instantiate(js, v8Module, getObserver())) {
-            KJ_IF_SOME(retry, retryAfterAsyncResolution()) {
-              catcher.Reset();
-              return kj::mv(retry);
-            }
-            if (catcher.HasCaught()) {
-              catcher.ReThrow();
-              throw JsExceptionThrown();
-            }
-            JSG_FAIL_REQUIRE(Error, "Failed to instantiate dynamically imported module.");
-          }
+        KJ_IF_SOME(fetching,
+            instantiateOrFetchMissing(js, v8Module, moduleDef,
+                "Failed to instantiate dynamically imported module."_kj, makeRestart())) {
+          return kj::mv(fetching);
         }
 
         auto evaluatePromise = evaluate(
@@ -899,7 +1112,7 @@ class IsolateModuleRegistry final {
         }
       }
 
-      KJ_IF_SOME(retry, retryAfterAsyncResolution()) {
+      KJ_IF_SOME(retry, retryAfterAsyncResolution(js, makeRestart())) {
         return kj::mv(retry);
       }
 
@@ -913,7 +1126,25 @@ class IsolateModuleRegistry final {
     }));
   }
 
+  // Resolves, instantiates, and evaluates the main module. With an asynchronous
+  // resolver, the main module and any missing static dependency are fetched the
+  // same way a dynamic import fetches them. Returns kj::none only when the module
+  // is not in the registry and no asynchronous resolver can supply it.
   kj::Maybe<Promise<Value>> resolveMainModuleAsync(Lock& js, const ResolveContext& context) {
+    lastUnresolvedContext = kj::none;
+
+    auto makeRestart = [&]() {
+      return [retryContext = OwnedResolveContext(context)](Lock& js) -> Promise<Value> {
+        auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
+        auto retry = retryContext.asResolveContext();
+        KJ_IF_SOME(promise, registry.resolveMainModuleAsync(js, retry)) {
+          return kj::mv(promise);
+        }
+        // The resolver stored a result that does not satisfy this specifier.
+        JSG_FAIL_REQUIRE(Error, "Module not found: ", retry.normalizedSpecifier.getHref());
+      };
+    };
+
     auto evaluate = [&](Entry& found) -> Promise<Value> {
       // Evaluation may rehash the lookup table, so do not retain Entry& across this call.
       auto module = found.key.getHandle(js);
@@ -932,6 +1163,12 @@ class IsolateModuleRegistry final {
           break;
       }
 
+      KJ_IF_SOME(fetching,
+          instantiateOrFetchMissing(
+              js, module, moduleDef, "Failed to instantiate the main module."_kj, makeRestart())) {
+        return kj::mv(fetching);
+      }
+
       auto evaluation = check(
           moduleDef.evaluate(js, module, getObserver(), inner.getEvaluator(PreserveIoContext::YES)))
                             .As<v8::Promise>();
@@ -947,25 +1184,8 @@ class IsolateModuleRegistry final {
     KJ_IF_SOME(found, resolveWithCaching(js, context)) {
       return evaluate(found);
     }
-    return kj::none;
-  }
-
-  MainModulePreparationResult prepareMainModule(Lock& js, const ResolveContext& context) {
-    auto prepare = [&](Entry& found) {
-      auto module = found.key.getHandle(js);
-      auto& moduleDef = found.module;
-      JSG_REQUIRE(moduleDef.isEsm(), TypeError, "Main module must be an ES module.");
-      return moduleDef.instantiate(js, module, getObserver()) ? MainModulePreparationResult::READY
-                                                              : MainModulePreparationResult::FAILED;
-    };
-
-    KJ_IF_SOME(found, findResolved(context)) {
-      return prepare(found);
-    }
-    KJ_IF_SOME(found, resolveWithCaching(js, context)) {
-      return prepare(found);
-    }
-    return MainModulePreparationResult::NOT_FOUND;
+    // The main module itself may be supplied by the asynchronous resolver.
+    return retryAfterAsyncResolution(js, makeRestart());
   }
 
   enum class RequireOption {
@@ -2676,27 +2896,6 @@ kj::Maybe<Promise<Value>> ModuleRegistry::tryResolveMainModuleAsync(
     .rawSpecifier = specifier,
   };
   return bound.resolveMainModuleAsync(js, context);
-}
-
-MainModulePreparationResult ModuleRegistry::tryPrepareMainModule(
-    Lock& js, kj::StringPtr specifier) {
-  auto& bound = IsolateModuleRegistry::from(js.v8Isolate);
-  const auto& base = bound.getBundleBase();
-  Url url = ([&]() -> Url {
-    KJ_IF_SOME(resolved, base.tryResolve(specifier)) {
-      return kj::mv(resolved);
-    }
-    js.throwException(js.typeError(kj::str("Invalid module specifier: "_kj, specifier)));
-  })();
-  auto normalized = url.clone(Url::EquivalenceOption::NORMALIZE_PATH);
-  ResolveContext context{
-    .type = ResolveContext::Type::BUNDLE,
-    .source = ResolveContext::Source::INTERNAL,
-    .normalizedSpecifier = normalized,
-    .referrerNormalizedSpecifier = base,
-    .rawSpecifier = specifier,
-  };
-  return bound.prepareMainModule(js, context);
 }
 
 JsValue ModuleRegistry::resolve(Lock& js,

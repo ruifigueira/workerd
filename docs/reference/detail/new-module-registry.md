@@ -274,13 +274,17 @@ It returns either a `Module` (resolved), a redirect string, or `kj::none` (not f
 ### `FallbackModuleBundle` (file-private)
 
 Used only for local development and dynamic Worker loading. A synchronous bundle
-invokes a `ResolveCallback` during lookup. An asynchronous bundle receives
-resolutions from the registry callback after a lookup miss.
-Both forms cache results in internal `storage` and `aliases` maps.
+invokes a `ResolveCallback` during lookup; the static `moduleFallback` service
+uses this form. An asynchronous bundle has no callback of its own: it receives
+resolutions through `ModuleRegistry::storeAsyncResolution()` after a lookup
+miss, and `Builder::setAsyncResolveCallback()` installs it. Dynamic Workers use
+only the asynchronous form, for both the startup static-import graph and runtime
+dynamic imports. Both forms cache results in internal `storage` and `aliases` maps.
 
-The `SupportsRequire` option controls whether `require()` can use a fallback
-bundle. Dynamic Worker fallback bundles set this option to `NO`. Their modules
-also use `Flags::NO_REQUIRE` to prevent access through the isolate resolution cache.
+The `SupportsRequire` option controls whether `require()` can use a synchronous
+fallback bundle. The asynchronous bundle never supports `require()`, and dynamic
+Worker fallback modules also use `Flags::NO_REQUIRE` to prevent access through
+the isolate resolution cache.
 
 The registry option `CANONICAL_FALLBACK_URLS` selects how fallback modules are
 addressed. `workerd` sets it only for dynamic Worker registries:
@@ -412,10 +416,27 @@ User code: const mod = await import('./bar.js')
    c. If the lookup misses, call the optional asynchronous resolver with an
       owned ResolveContext.
    d. Store the module or redirect in the asynchronous fallback bundle.
-   e. Retry the original dynamic import. Static dependencies can repeat steps
-      c and d during module instantiation.
-   f. Call module.evaluate() with `PreserveIoContext::YES` -> Promise
-   g. Chain: .then(namespace -> resolve Promise with module namespace)
+   e. Retry the original dynamic import.
+   f. Before instantiating an ES module in a registry with an asynchronous
+      resolver, walk v8::Module::GetModuleRequests() through every
+      already-resolvable, not-yet-instantiated dependency. Fetch every miss
+      at once, store the results, and retry from step 5a; the rescan picks
+      up dependencies the fetched modules introduce. Instantiation only
+      begins once a scan finds nothing missing. Should instantiation still
+      report a miss, steps c-e handle that one dependency.
+   g. Call module.evaluate() with `PreserveIoContext::YES` -> Promise
+   h. Chain: .then(namespace -> resolve Promise with module namespace)
+
+Static imports resolve synchronously inside V8's InstantiateModule(), so
+this is the only place asynchronous fetching can happen: before V8 asks.
+Fetch latency for a graph therefore scales with its depth, not its size.
+
+Deferred main-module evaluation for dynamic Worker startup
+(`ModuleRegistry::tryResolveMainModuleAsync`) uses the same steps c-f. The
+main module itself may be a miss the asynchronous resolver supplies; its
+`ResolveContext` carries `Source::INTERNAL`, which the `workerd` resolver maps
+to the fallback service's `internal` type and to `Flags::MAIN` on the returned
+module. There is no separate synchronous path for startup.
 
 6. Return Promise to V8
 
