@@ -5228,6 +5228,8 @@ static kj::Promise<FetchedDynamicModule> fetchDynamicModule(IoContext& context,
   auto payload = json.encode(requestBuilder);
   auto headers = kj::HttpHeaders(context.getHeaderTable());
   headers.set(kj::HttpHeaderId::CONTENT_TYPE, MimeType::JSON.toString());
+  // Let globalOutbound distinguish this runtime-owned request from an author fetch.
+  headers.setPtr(context.getHeaderIds().authorization, "Kitesurf-Module-Fallback");
   auto client = context.getHttpClient(
       IoContext::NULL_CLIENT_CHANNEL, false, kj::none, "dynamic_module_fallback"_kjc);
   auto httpRequest = client->request(kj::HttpMethod::POST,

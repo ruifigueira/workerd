@@ -4,6 +4,7 @@
 
 #include "modules-new.h"
 
+#include <workerd/jsg/dynamic-import.h>
 #include <workerd/jsg/function.h>
 #include <workerd/jsg/jsg.h>
 #include <workerd/jsg/util.h>
@@ -230,8 +231,9 @@ class EsModule final: public Module {
   }
   KJ_DISALLOW_COPY_AND_MOVE(EsModule);
 
-  v8::MaybeLocal<v8::Module> getDescriptor(
-      Lock& js, const CompilationObserver& observer) const override {
+  v8::MaybeLocal<v8::Module> getDescriptor(Lock& js,
+      const CompilationObserver& observer,
+      DynamicImportMode dynamicImportMode) const override {
     auto metrics = observer.onEsmCompilationStart(js.v8Isolate, kj::str(id().getHref()),
         type() == Type::BUNDLE ? CompilationObserver::Option::BUNDLE
                                : CompilationObserver::Option::BUILTIN);
@@ -245,8 +247,10 @@ class EsModule final: public Module {
     // V8 returns these options for dynamic imports, so the callback can restore
     // the referrer's resolution context without relying on its URL.
     auto hostDefinedOptions = v8::PrimitiveArray::New(js.v8Isolate, 1);
-    hostDefinedOptions->Set(
-        js.v8Isolate, 0, v8::Int32::New(js.v8Isolate, static_cast<int>(type())));
+    auto dynamicImportOption = dynamicImportMode == DynamicImportMode::FALLBACK_ONLY
+        ? FALLBACK_ONLY_IMPORTS_HOST_DEFINED_OPTION
+        : static_cast<int>(type());
+    hostDefinedOptions->Set(js.v8Isolate, 0, v8::Int32::New(js.v8Isolate, dynamicImportOption));
     v8::ScriptOrigin origin(js.str(id().getHref()), resourceLineOffset, resourceColumnOffset,
         resourceIsSharedCrossOrigin, scriptId, {}, resourceIsOpaque, isWasm, true,
         hostDefinedOptions);
@@ -457,7 +461,8 @@ class SyntheticModule final: public Module {
     KJ_DASSERT(!isEsm() && !isMain());
   }
 
-  v8::MaybeLocal<v8::Module> getDescriptor(Lock& js, const CompilationObserver&) const override {
+  v8::MaybeLocal<v8::Module> getDescriptor(
+      Lock& js, const CompilationObserver&, DynamicImportMode) const override {
     // We add one to the size to accomodate the default export.
     v8::LocalVector<v8::String> exports(js.v8Isolate, namedExports.size() + 1);
     int n = 0;
@@ -651,13 +656,14 @@ class IsolateModuleRegistry final {
   };
 
   // One v8::Module instantiation of an underlying Module definition. A
-  // definition is instantiated at most once per (specifier URL, definition)
-  // pair, which encodes the module-identity rules this registry guarantees:
+  // definition is instantiated at most once per (specifier URL, definition,
+  // resolution type) tuple, which encodes the module-identity rules this
+  // registry guarantees:
   //
   //  * Query/fragment-distinct specifiers produce distinct instances, each
   //    with its own import.meta.url, per the HTML module-map model
   //    (import('./foo?a') !== import('./foo?b')).
-  //  * The same specifier resolved through different context types shares one
+  //  * The same specifier resolved through compatible context types shares one
   //    instance when it resolves to the same definition — e.g.
   //    process.getBuiltinModule('cloudflare:sockets') must be reference-equal
   //    to the namespace obtained via import(), and a builtin imported by both
@@ -675,6 +681,8 @@ class IsolateModuleRegistry final {
     // The URL reported as import.meta.url. Fallback redirects use their target URL.
     Url importMetaUrl;
     const Module& module;
+    // Controls the visibility of this module's static and dynamic imports.
+    ResolveContext::Type resolveType;
   };
 
   IsolateModuleRegistry(
@@ -702,20 +710,22 @@ class IsolateModuleRegistry final {
     // apply that redirect here, as a last resort, so that a worker bundle module
     // that intentionally shadows "node:process" (exactly as it could for any other
     // built-in) gets first crack at resolving it above.
-    KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, context.normalizedSpecifier)) {
-      auto processSpec = kj::str(processUrl.getHref());
-      ResolveContext processContext = {
-        .type = ResolveContext::Type::BUILTIN_ONLY,
-        .source = context.source,
-        .normalizedSpecifier = processUrl,
-        .referrerNormalizedSpecifier = context.referrerNormalizedSpecifier,
-        .rawSpecifier = processSpec.asPtr(),
-      };
-      KJ_IF_SOME(found, findResolved(processContext)) {
-        return found.key.getHandle(js);
-      }
-      KJ_IF_SOME(found, resolveWithCaching(js, processContext)) {
-        return found.key.getHandle(js);
+    if (context.type != ResolveContext::Type::FALLBACK_ONLY) {
+      KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, context.normalizedSpecifier)) {
+        auto processSpec = kj::str(processUrl.getHref());
+        ResolveContext processContext = {
+          .type = ResolveContext::Type::BUILTIN_ONLY,
+          .source = context.source,
+          .normalizedSpecifier = processUrl,
+          .referrerNormalizedSpecifier = context.referrerNormalizedSpecifier,
+          .rawSpecifier = processSpec.asPtr(),
+        };
+        KJ_IF_SOME(found, findResolved(processContext)) {
+          return found.key.getHandle(js);
+        }
+        KJ_IF_SOME(found, resolveWithCaching(js, processContext)) {
+          return found.key.getHandle(js);
+        }
       }
     }
 
@@ -870,20 +880,22 @@ class IsolateModuleRegistry final {
       // apply that redirect here, as a last resort, so that a worker bundle module
       // that intentionally shadows "node:process" gets first crack at resolving it
       // above.
-      KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, normalizedSpecifier)) {
-        auto processSpec = kj::str(processUrl.getHref());
-        ResolveContext processContext = {
-          .type = ResolveContext::Type::BUILTIN_ONLY,
-          .source = ResolveContext::Source::DYNAMIC_IMPORT,
-          .normalizedSpecifier = processUrl,
-          .referrerNormalizedSpecifier = referrer,
-          .rawSpecifier = processSpec.asPtr(),
-        };
-        KJ_IF_SOME(found, findResolved(processContext)) {
-          return handleFoundModule(found);
-        }
-        KJ_IF_SOME(found, resolveWithCaching(js, processContext)) {
-          return handleFoundModule(found);
+      if (referrerType != ResolveContext::Type::FALLBACK_ONLY) {
+        KJ_IF_SOME(processUrl, maybeRedirectNodeProcess(js, normalizedSpecifier)) {
+          auto processSpec = kj::str(processUrl.getHref());
+          ResolveContext processContext = {
+            .type = ResolveContext::Type::BUILTIN_ONLY,
+            .source = ResolveContext::Source::DYNAMIC_IMPORT,
+            .normalizedSpecifier = processUrl,
+            .referrerNormalizedSpecifier = referrer,
+            .rawSpecifier = processSpec.asPtr(),
+          };
+          KJ_IF_SOME(found, findResolved(processContext)) {
+            return handleFoundModule(found);
+          }
+          KJ_IF_SOME(found, resolveWithCaching(js, processContext)) {
+            return handleFoundModule(found);
+          }
         }
       }
 
@@ -1256,17 +1268,19 @@ class IsolateModuleRegistry final {
     const Entry& keyForRow(const Entry& entry) const {
       return entry;
     }
-    bool matches(const Entry& entry, const Url& id, const Module* def) const {
-      return &entry.module == def && entry.id == id;
+    bool matches(
+        const Entry& entry, const Url& id, const Module* def, ResolveContext::Type type) const {
+      return &entry.module == def && entry.id == id && entry.resolveType == type;
     }
     bool matches(const Entry& entry, const Entry& other) const {
-      return &entry.module == &other.module && entry.id == other.id;
+      return &entry.module == &other.module && entry.id == other.id &&
+          entry.resolveType == other.resolveType;
     }
-    uint hashCode(const Url& id, const Module* def) const {
-      return kj::hashCode(id, def);
+    uint hashCode(const Url& id, const Module* def, ResolveContext::Type type) const {
+      return kj::hashCode(id, def, type);
     }
     uint hashCode(const Entry& entry) const {
-      return kj::hashCode(entry.id, &entry.module);
+      return kj::hashCode(entry.id, &entry.module, entry.resolveType);
     }
   };
 
@@ -1286,7 +1300,11 @@ class IsolateModuleRegistry final {
       // The resolutions entry always has a matching instantiation:
       // resolveWithCaching() records the resolution only after the
       // instantiation row has been inserted.
-      return KJ_ASSERT_NONNULL(instantiations.find<kj::HashIndex<InstanceCallbacks>>(id, def));
+      auto resolveType = type == ResolveContext::Type::FALLBACK_ONLY
+          ? ResolveContext::Type::FALLBACK_ONLY
+          : moduleTypeToResolveContextType(def->type());
+      return KJ_ASSERT_NONNULL(
+          instantiations.find<kj::HashIndex<InstanceCallbacks>>(id, def, resolveType));
     }
     return kj::none;
   }
@@ -1318,6 +1336,14 @@ class IsolateModuleRegistry final {
 
     auto lookup = inner.lookupWithUnresolved(innerContext, noopResolveObserver);
     KJ_IF_SOME(found, lookup.module) {
+      // CommonJS evaluation creates its own require() and dynamic-import callbacks,
+      // which currently resolve with bundle visibility. Reject it rather than let a
+      // fallback-only graph regain access to bundle and builtin modules.
+      JSG_REQUIRE(context.type != ResolveContext::Type::FALLBACK_ONLY || !found.isCommonJs(),
+          TypeError, "Fallback-only imports do not support CommonJS modules.");
+      auto resolveType = context.type == ResolveContext::Type::FALLBACK_ONLY
+          ? ResolveContext::Type::FALLBACK_ONLY
+          : moduleTypeToResolveContextType(found.type());
       // Reuse the existing instantiation for this (specifier, definition) if
       // one exists (e.g. the same builtin already resolved through a different
       // context type); otherwise instantiate now. Instantiation can fail —
@@ -1327,18 +1353,22 @@ class IsolateModuleRegistry final {
       Entry& entry = ([&]() -> Entry& {
         KJ_IF_SOME(existing,
             instantiations.find<kj::HashIndex<InstanceCallbacks>>(
-                context.normalizedSpecifier, &found)) {
+                context.normalizedSpecifier, &found, resolveType)) {
           return existing;
         }
         return instantiations.insert(Entry{
-          .key = HashableV8Ref<v8::Module>(
-              js.v8Isolate, check(found.getDescriptor(js, getObserver()))),
+          .key = HashableV8Ref<v8::Module>(js.v8Isolate,
+              check(found.getDescriptor(js, getObserver(),
+                  resolveType == ResolveContext::Type::FALLBACK_ONLY
+                      ? DynamicImportMode::FALLBACK_ONLY
+                      : DynamicImportMode::DEFAULT))),
           .id = context.normalizedSpecifier.clone(),
           .importMetaUrl =
               found.type() == Module::Type::FALLBACK && inner.usesCanonicalFallbackUrls()
               ? found.id().clone()
               : context.normalizedSpecifier.clone(),
           .module = found,
+          .resolveType = resolveType,
         });
       })();
 
@@ -1363,7 +1393,8 @@ class IsolateModuleRegistry final {
   }
 
   // The instantiation table: one row per live v8::Module, keyed by handle
-  // (EntryCallbacks) and by (specifier URL, definition) (InstanceCallbacks).
+  // (EntryCallbacks) and by (specifier URL, definition, resolution type)
+  // (InstanceCallbacks).
   kj::Table<Entry, kj::HashIndex<EntryCallbacks>, kj::HashIndex<InstanceCallbacks>> instantiations;
 
   // The resolution cache: (context type, specifier URL) → the definition it
@@ -1560,6 +1591,23 @@ v8::MaybeLocal<v8::Promise> dynamicImportModuleCallback(v8::Local<v8::Context> c
         auto str = js.toString(resource_name);
         maybeReferrer = Url::tryParse(str.asPtr());
       }
+      bool fallbackOnlyImports = false;
+      bool useBundleBaseAsReferrer = false;
+      if (!host_defined_options.IsEmpty()) {
+        auto options = host_defined_options.As<v8::PrimitiveArray>();
+        if (options->Length() == 1) {
+          auto value = options->Get(js.v8Isolate, 0);
+          if (value->IsInt32()) {
+            auto option = value.As<v8::Int32>()->Value();
+            fallbackOnlyImports = isFallbackOnlyImportsHostDefinedOption(option);
+            useBundleBaseAsReferrer =
+                option == FALLBACK_ONLY_IMPORTS_WITHOUT_REFERRER_HOST_DEFINED_OPTION;
+          }
+        }
+      }
+      if (maybeReferrer == kj::none && useBundleBaseAsReferrer) {
+        maybeReferrer = registry.getBundleBase().clone();
+      }
       Url referrer = KJ_UNWRAP_OR(kj::mv(maybeReferrer), {
         return rejected(js,
             js.typeError(kj::str("Referring module not found in the registry: ",
@@ -1568,8 +1616,9 @@ v8::MaybeLocal<v8::Promise> dynamicImportModuleCallback(v8::Local<v8::Context> c
 
       // ES modules carry their Module::Type in host-defined options. Other scripts
       // with a URL origin (CommonJS-style eval functions) use bundle visibility.
-      auto referrerType = ResolveContext::Type::BUNDLE;
-      if (!host_defined_options.IsEmpty()) {
+      auto referrerType =
+          fallbackOnlyImports ? ResolveContext::Type::FALLBACK_ONLY : ResolveContext::Type::BUNDLE;
+      if (!fallbackOnlyImports && !host_defined_options.IsEmpty()) {
         auto options = host_defined_options.As<v8::PrimitiveArray>();
         if (options->Length() == 1) {
           auto value = options->Get(js.v8Isolate, 0);
@@ -1685,7 +1734,7 @@ v8::MaybeLocal<std::conditional_t<IsSourcePhase, v8::Object, v8::Module>> resolv
     // into the table's storage.
     Url referrerUrl = registry.lookup(js, referrer)
                           .map([&](IsolateModuleRegistry::Entry& entry) -> Url {
-      type = moduleTypeToResolveContextType(entry.module.type());
+      type = entry.resolveType;
       return registry.getReferrerUrl(entry).clone();
     }).orDefault(registry.getBundleBase().clone());
 
@@ -2468,9 +2517,11 @@ kj::Maybe<const Module&> ModuleRegistry::lookupImpl(Impl& impl,
       // in that order.
       MODULE_LOOKUP(context, kBundle);
       MODULE_LOOKUP(context, kBuiltin);
+      [[fallthrough]];
+    }
+    case ResolveContext::Type::FALLBACK_ONLY: {
       KJ_IF_SOME(fallbackSpecifier, context.fallbackSpecifier) {
-        // Bundle and builtin lookups use the stripped specifier. The fallback
-        // service gets the full normalized specifier.
+        // The fallback service gets the full normalized specifier.
         ResolveContext fallbackContext{
           .type = context.type,
           .source = context.source,
@@ -2704,6 +2755,10 @@ bool Module::isMain() const {
 
 bool Module::isWasm() const {
   return (flags_ & Flags::WASM) == Flags::WASM;
+}
+
+bool Module::isCommonJs() const {
+  return (flags_ & Flags::COMMON_JS) == Flags::COMMON_JS;
 }
 
 bool Module::supportsRequire() const {

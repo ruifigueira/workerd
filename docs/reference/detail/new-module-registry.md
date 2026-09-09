@@ -95,10 +95,12 @@ IsolateModuleRegistry
   |       |-- importMetaUrl: Url              (import.meta.url; the redirect target for
   |       |                                    fallback redirects under
   |       |                                    CANONICAL_FALLBACK_URLS, else same as id)
-  |       +-- module: const Module&           (back-ref to definition)
+  |       |-- module: const Module&           (back-ref to definition)
+  |       +-- resolveType: ResolveContext::Type (visibility for child imports)
   |     Indices:
   |       |-- HashIndex<EntryCallbacks>     -- by v8::Module identity
-  |       +-- HashIndex<InstanceCallbacks>  -- by (specifier URL, definition)
+  |       +-- HashIndex<InstanceCallbacks>  -- by (specifier URL, definition,
+  |                                            resolution type)
   +-- resolutions: HashMap<SpecifierContext, const Module*>
         maps (context type, specifier URL) -> the definition it resolves to
 ```
@@ -108,12 +110,14 @@ The two-level split encodes the module-identity rules the registry guarantees:
 - **Query/fragment-distinct specifiers produce distinct instances**, each with
   its own `import.meta.url` (`import('./foo?a') !== import('./foo?b')`), per the
   HTML module-map model.
-- **The same specifier resolved through different context types shares one
+- **The same specifier resolved through compatible context types shares one
   instance when it resolves to the same definition** — e.g.
   `process.getBuiltinModule('cloudflare:sockets')` is reference-equal to the
   namespace obtained via `import()`, and a builtin imported by both user code
   and other builtins remains a per-isolate singleton (module-level state is
-  never duplicated).
+  never duplicated). `FALLBACK_ONLY` is deliberately incompatible with normal
+  bundle resolution: it gets a separate instance so every child import remains
+  restricted to the fallback service.
 - **The same specifier resolved to different definitions yields distinct
   instances** — a worker-bundle module shadowing a builtin name coexists with
   the real builtin, and `PUBLIC_BUILTIN` resolution never observes the shadow.
@@ -141,6 +145,8 @@ map to multiple rows, so a unique URL index would collide.
 | `ESM`  | 0x02 | ECMAScript module (vs synthetic)                                   |
 | `EVAL` | 0x04 | Requires embedder-managed evaluation through an `EvalCallback`    |
 | `WASM` | 0x08 | WebAssembly module                                                 |
+| `NO_REQUIRE` | 0x10 | Cannot be loaded through `require()`                           |
+| `COMMON_JS` | 0x20 | Evaluates CommonJS source                                      |
 
 ### `Module::ContentType` enum
 

@@ -7,7 +7,7 @@ const unitTests :Workerd.Config = (
         modules = [
           (name = "worker", esModule = embed "unsafe-test.js")
         ],
-        compatibilityFlags = ["nodejs_compat", "experimental"],
+        compatibilityFlags = ["nodejs_compat", "experimental", "legacy_module_registry"],
         bindings = [
           (name = "unsafe", unsafeEval = void )
         ]

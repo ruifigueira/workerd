@@ -1,5 +1,6 @@
 #pragma once
 
+#include <workerd/jsg/dynamic-import.h>
 #include <workerd/jsg/jsg.h>
 
 namespace workerd::jsg {
@@ -22,8 +23,10 @@ class NonModuleScript final {
 
   jsg::JsValue runAndReturn(jsg::Lock& js) const;
 
-  static jsg::NonModuleScript compile(
-      jsg::Lock& js, kj::StringPtr code, kj::StringPtr name = "worker.js");
+  static jsg::NonModuleScript compile(jsg::Lock& js,
+      kj::StringPtr code,
+      kj::StringPtr name = "worker.js",
+      DynamicImportMode dynamicImportMode = DynamicImportMode::DEFAULT);
 
  private:
   v8::Global<v8::UnboundScript> unboundScript;

@@ -191,9 +191,8 @@ struct ResolveContext final {
   using Source = ResolveObserver::Source;
   using Type = ResolveObserver::Context;
 
-  // The type of module being resolved (one of BUNDLE, BUILTIN, BUILTIN_ONLY,
-  // or PUBLIC_BUILTIN — the last resolves only user-importable built-ins, e.g.
-  // for process.getBuiltinModule()).
+  // The type of module being resolved. This controls which bundle groups are
+  // visible during lookup.
   Type type;
 
   // The source of the module resolution (e.g. import, dynamic import, require, etc);
@@ -254,9 +253,8 @@ WD_STRONG_BOOL(PreserveIoContext);
 // by an ESM module script. Synthetic modules are any other type of module.
 class Module {
  public:
-  // The types here echo the types in ResolveContext::Type but also include
-  // the FALLBACK, which is used to identify modules that are loaded from the
-  // fallback service.
+  // Identifies the bundle group that provided the module definition. FALLBACK
+  // identifies modules loaded from the fallback service.
   enum class Type : uint8_t {
     BUNDLE,
     BUILTIN,
@@ -295,6 +293,8 @@ class Module {
     WASM = 1 << 3,
     // A Module with the NO_REQUIRE flag set cannot be loaded through require().
     NO_REQUIRE = 1 << 4,
+    // A Module with the COMMON_JS flag set evaluates CommonJS source.
+    COMMON_JS = 1 << 5,
   };
 
   // The Evaluator controls whether embedder-managed module evaluation preserves
@@ -342,6 +342,9 @@ class Module {
   // If isWasm() returns true, then the module is a WebAssembly module.
   bool isWasm() const;
 
+  // If isCommonJs() returns true, then the module evaluates CommonJS source.
+  bool isCommonJs() const;
+
   bool supportsRequire() const;
 
   // Returns the content type of the module.
@@ -354,8 +357,10 @@ class Module {
   // maybe is empty, then an exception should have been scheduled on the isolate
   // via the lock. Do not throw C++ exceptions from this method unless they are fatal.
   // The returned v8::Module is not yet instantiated.
-  virtual v8::MaybeLocal<v8::Module> getDescriptor(
-      Lock& js, const CompilationObserver& observer) const KJ_WARN_UNUSED_RESULT = 0;
+  virtual v8::MaybeLocal<v8::Module> getDescriptor(Lock& js,
+      const CompilationObserver& observer,
+      DynamicImportMode dynamicImportMode = DynamicImportMode::DEFAULT) const
+      KJ_WARN_UNUSED_RESULT = 0;
 
   // Determines if this module can be resolved in the given context.
   virtual bool evaluateContext(const ResolveContext& context) const KJ_WARN_UNUSED_RESULT;

@@ -727,6 +727,17 @@ KJ_TEST("Compound Registry") {
   }
 
   {
+    // Fallback-only resolution finds fallback modules without exposing any
+    // worker-bundle or builtin module.
+    auto& module = KJ_ASSERT_NONNULL(resolve(registry, ResolveContext::Type::FALLBACK_ONLY, foo));
+    KJ_ASSERT(module.id() == foo);
+    KJ_ASSERT(module.type() == Module::Type::FALLBACK);
+    KJ_ASSERT(resolve(registry, ResolveContext::Type::FALLBACK_ONLY, bar) == kj::none);
+    KJ_ASSERT(resolve(registry, ResolveContext::Type::FALLBACK_ONLY, baz) == kj::none);
+    KJ_ASSERT(resolve(registry, ResolveContext::Type::FALLBACK_ONLY, qux) == kj::none);
+  }
+
+  {
     // A built-in module is resolved when using a bundle context
     auto& module = KJ_ASSERT_NONNULL(resolve(registry, ResolveContext::Type::BUNDLE, bar));
     KJ_ASSERT(module.id() == bar);
@@ -782,8 +793,8 @@ KJ_TEST("Compound Registry") {
   KJ_ASSERT(resolve(registry, ResolveContext::Type::BUILTIN, qux) == kj::none);
   KJ_ASSERT(resolve(registry, ResolveContext::Type::BUILTIN_ONLY, qux) == kj::none);
 
-  // We should have seen eleven distinct resolution events.
-  KJ_ASSERT(observer.modules.size() == 11);
+  // We should have seen fifteen distinct resolution events.
+  KJ_ASSERT(observer.modules.size() == 15);
 }
 
 // ======================================================================================
@@ -3571,10 +3582,12 @@ KJ_TEST("Only lookups that consult the fallback report an unresolved specifier")
     return registry->lookupWithUnresolved(context, resolveObserver);
   };
 
-  // Bundle lookups search the fallback bundles, so a miss there is a candidate
-  // for asynchronous resolution.
+  // Bundle and fallback-only lookups search the fallback bundles, so a miss there
+  // is a candidate for asynchronous resolution.
   KJ_ASSERT(
       KJ_ASSERT_NONNULL(lookup(ResolveContext::Type::BUNDLE).unresolvedSpecifier) == moduleUrl);
+  KJ_ASSERT(KJ_ASSERT_NONNULL(lookup(ResolveContext::Type::FALLBACK_ONLY).unresolvedSpecifier) ==
+      moduleUrl);
 
   // Builtin lookups never reach the fallback bundles, so fetching the module would
   // not make it resolvable.

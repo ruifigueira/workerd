@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <workerd/jsg/dynamic-import.h>
 #include <workerd/jsg/function.h>
 #include <workerd/jsg/modules.capnp.h>
 #include <workerd/jsg/observer.h>
@@ -732,6 +733,17 @@ v8::MaybeLocal<v8::Promise> dynamicImportCallback(v8::Local<v8::Context> context
     }
     return v8::Local<v8::Promise>();
   };
+
+  if (!host_defined_options.IsEmpty()) {
+    auto options = host_defined_options.As<v8::PrimitiveArray>();
+    if (options->Length() == 1) {
+      auto value = options->Get(js.v8Isolate, 0);
+      if (value->IsInt32() &&
+          isFallbackOnlyImportsHostDefinedOption(value.As<v8::Int32>()->Value())) {
+        return makeRejected(js.v8Error("Fallback-only imports require the new module registry."));
+      }
+    }
+  }
 
   // The specification for import attributes strongly recommends that embedders
   // reject import attributes and types they do not understand/implement. This

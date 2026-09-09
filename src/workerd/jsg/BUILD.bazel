@@ -91,6 +91,7 @@ wd_cc_library(
     hdrs = [
         "async-context.h",
         "dom-exception.h",
+        "dynamic-import.h",
         "fast-api.h",
         "function.h",
         "jsg.h",

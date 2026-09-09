@@ -14,6 +14,10 @@ let maxActiveModuleFallbackRequests = 0;
 export class Outbound extends WorkerEntrypoint {
   async fetch(request) {
     if (request.method === 'POST') {
+      assert.strictEqual(
+        request.headers.get('authorization'),
+        'Kitesurf-Module-Fallback'
+      );
       const resolution = await request.json();
       moduleFallbackRequests.push(resolution);
       switch (resolution.specifier) {
@@ -38,6 +42,63 @@ export class Outbound extends WorkerEntrypoint {
           return Response.json({
             esModule: "export const remote = 'remote';",
           });
+        case 'file:///bundle/fallback-only.js':
+          return Response.json({
+            esModule: `
+              import value from './transitive.js';
+              const dynamicValue = (await import('./dynamic-transitive.js')).default;
+              let dynamicBuiltinRejected = false;
+              try {
+                await import('workerd:unsafe-eval');
+              } catch {
+                dynamicBuiltinRejected = true;
+              }
+              export default 'fallback:' + value + ':' + dynamicValue + ':' + dynamicBuiltinRejected;
+            `,
+          });
+        case 'file:///bundle/transitive.js':
+          return Response.json({
+            esModule: "export default 'fallback-dependency';",
+          });
+        case 'file:///bundle/dynamic-transitive.js':
+          return Response.json({
+            esModule: "export default 'fallback-dynamic';",
+          });
+        case 'file:///bundle/static-builtin.js':
+          return Response.json({
+            esModule: `
+              import unsafeEval from 'workerd:unsafe-eval';
+              export default unsafeEval;
+            `,
+          });
+        case 'file:///bundle/identity-normal-first.js':
+        case 'file:///bundle/identity-fallback-first.js':
+          return Response.json({
+            esModule: `
+              import dependency from './identity-dependency.js';
+              export default { dependency };
+            `,
+          });
+        case 'file:///bundle/identity-dependency.js':
+          return Response.json({
+            esModule: "export default 'fallback-identity';",
+          });
+        case 'file:///bundle/fallback-cjs.js':
+          return Response.json({
+            commonJsModule: "module.exports = 'commonjs';",
+          });
+        case 'file:///bundle/referrerless.js':
+          return Response.json({
+            esModule: `
+              import value from './referrerless-dependency.js';
+              const timer = await new Promise((resolve) => setTimeout(resolve, 0, 'timer'));
+              export default 'referrerless:' + value + ':' + timer;
+            `,
+          });
+        case 'file:///bundle/referrerless-dependency.js':
+          return Response.json({ esModule: "export default 'dependency';" });
+        case 'file:///bundle/referrer/fallback-relative.js':
+          return Response.json({ esModule: "export default 'relative';" });
         case 'file:///bundle/value.json':
           return Response.json({ json: '{"answer":42}' });
         case 'file:///bundle/runtime-redirect.js':
@@ -558,6 +619,198 @@ export const asyncStartupModuleFallbackPrefersBundle = {
     assert.deepStrictEqual(
       moduleFallbackRequests.map(({ specifier }) => specifier),
       ['file:///bundle/remote.js']
+    );
+  },
+};
+
+export const unsafeEvalFallbackOnlyImports = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+        'nodejs_compat',
+        'unsafe_module',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          import unsafeEval from 'workerd:unsafe-eval';
+
+          export default {
+            async fetch() {
+              const bundled = await unsafeEval.eval(
+                "import('./fallback-only.js')",
+                'file:///bundle/eval.js'
+              );
+              const fallback = await unsafeEval.eval(
+                "import('./fallback-only.js')",
+                'file:///bundle/eval.js',
+                true
+              );
+              const explicitFalse = await unsafeEval.eval(
+                "import('./fallback-only.js')",
+                'file:///bundle/eval.js',
+                false
+              );
+              const normalFirstNormal = await unsafeEval.eval(
+                "import('./identity-normal-first.js')",
+                'file:///bundle/eval.js'
+              );
+              const normalFirstFallback = await unsafeEval.eval(
+                "import('./identity-normal-first.js')",
+                'file:///bundle/eval.js',
+                true
+              );
+              const fallbackFirstFallback = await unsafeEval.eval(
+                "import('./identity-fallback-first.js')",
+                'file:///bundle/eval.js',
+                true
+              );
+              const fallbackFirstNormal = await unsafeEval.eval(
+                "import('./identity-fallback-first.js')",
+                'file:///bundle/eval.js'
+              );
+              const referrerless = await unsafeEval.eval(
+                "import('./referrerless.js')",
+                undefined,
+                true
+              );
+              const relative = await unsafeEval.eval(
+                "import('./fallback-relative.js')",
+                'file:///bundle/referrer/eval.js',
+                true
+              );
+              let builtinRejected = false;
+              try {
+                await unsafeEval.eval(
+                  "import('workerd:unsafe-eval')",
+                  'file:///bundle/eval.js',
+                  true
+                );
+              } catch {
+                builtinRejected = true;
+              }
+              let nodeProcessRejected = false;
+              try {
+                await unsafeEval.eval(
+                  "import('node:process')",
+                  'file:///bundle/eval.js',
+                  true
+                );
+              } catch {
+                nodeProcessRejected = true;
+              }
+              let transitiveStaticBuiltinRejected = false;
+              try {
+                await unsafeEval.eval(
+                  "import('./static-builtin.js')",
+                  'file:///bundle/eval.js',
+                  true
+                );
+              } catch {
+                transitiveStaticBuiltinRejected = true;
+              }
+              let invalidReferrerRejected = false;
+              try {
+                await unsafeEval.eval(
+                  "import('./fallback-only.js')",
+                  'not a URL',
+                  true
+                );
+              } catch {
+                invalidReferrerRejected = true;
+              }
+              let commonJsRejected = false;
+              try {
+                await unsafeEval.eval(
+                  "import('./fallback-cjs.js')",
+                  'file:///bundle/eval.js',
+                  true
+                );
+              } catch {
+                commonJsRejected = true;
+              }
+
+              return Response.json({
+                bundled: bundled.default,
+                fallback: fallback.default,
+                explicitFalse: explicitFalse.default,
+                normalFirst: {
+                  normal: normalFirstNormal.default.dependency,
+                  fallback: normalFirstFallback.default.dependency,
+                  distinct: normalFirstNormal !== normalFirstFallback,
+                },
+                fallbackFirst: {
+                  fallback: fallbackFirstFallback.default.dependency,
+                  normal: fallbackFirstNormal.default.dependency,
+                  distinct: fallbackFirstFallback !== fallbackFirstNormal,
+                },
+                referrerless: referrerless.default,
+                relative: relative.default,
+                builtinRejected,
+                nodeProcessRejected,
+                transitiveStaticBuiltinRejected,
+                invalidReferrerRejected,
+                commonJsRejected,
+              });
+            },
+          };
+        `,
+        'fallback-only.js': "export default 'bundle';",
+        'transitive.js': "export default 'bundle-dependency';",
+        'dynamic-transitive.js': "export default 'bundle-dynamic';",
+        'identity-dependency.js': "export default 'bundle-identity';",
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.deepStrictEqual(await response.json(), {
+      bundled: 'bundle',
+      fallback: 'fallback:fallback-dependency:fallback-dynamic:true',
+      explicitFalse: 'bundle',
+      normalFirst: {
+        normal: 'bundle-identity',
+        fallback: 'fallback-identity',
+        distinct: true,
+      },
+      fallbackFirst: {
+        fallback: 'fallback-identity',
+        normal: 'bundle-identity',
+        distinct: true,
+      },
+      referrerless: 'referrerless:dependency:timer',
+      relative: 'relative',
+      builtinRejected: true,
+      nodeProcessRejected: true,
+      transitiveStaticBuiltinRejected: true,
+      invalidReferrerRejected: true,
+      commonJsRejected: true,
+    });
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier),
+      [
+        'file:///bundle/fallback-only.js',
+        'file:///bundle/transitive.js',
+        'file:///bundle/dynamic-transitive.js',
+        'workerd:unsafe-eval',
+        'file:///bundle/identity-normal-first.js',
+        'file:///bundle/identity-dependency.js',
+        'file:///bundle/identity-fallback-first.js',
+        'file:///bundle/referrerless.js',
+        'file:///bundle/referrerless-dependency.js',
+        'file:///bundle/referrer/fallback-relative.js',
+        'workerd:unsafe-eval',
+        'node:process',
+        'file:///bundle/static-builtin.js',
+        'workerd:unsafe-eval',
+        'file:///bundle/fallback-cjs.js',
+      ]
     );
   },
 };

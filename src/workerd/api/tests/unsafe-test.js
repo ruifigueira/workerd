@@ -1,7 +1,7 @@
 // Copyright (c) 2023 Cloudflare, Inc.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
-import { strictEqual, throws } from 'node:assert';
+import { rejects, strictEqual, throws } from 'node:assert';
 
 export const basics = {
   test(ctx, env) {
@@ -18,6 +18,17 @@ export const basics = {
 
     // Regular dynamic eval is still not allowed
     throws(() => eval(''));
+  },
+};
+
+export const fallbackOnlyImportsRequireNewModuleRegistry = {
+  async test(ctx, env) {
+    await rejects(env.unsafe.eval("import('node:assert')", 'worker', true), {
+      message: 'Fallback-only imports require the new module registry.',
+    });
+    await rejects(env.unsafe.eval("import('node:assert')", undefined, true), {
+      message: 'Fallback-only imports require the new module registry.',
+    });
   },
 };
 

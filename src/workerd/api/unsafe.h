@@ -30,11 +30,17 @@ class UnsafeEval: public jsg::Object {
   // A non-capturing eval. Compile and evaluates the given script, returning whatever
   // value is returned by the script. This version of eval intentionally does not
   // capture any part of the outer scope other than globalThis and globally scoped
-  // variables. The optional `name` will appear in stack traces for any errors thrown.
+  // variables. The optional `name` will appear in stack traces for any errors thrown. If
+  // `fallbackOnlyImports` is true, `name` is the referrer URL, and dynamic imports resolve only
+  // through the module fallback service. An omitted name uses the bundle base as the referrer.
+  // This mode requires the new module registry.
   //
   // console.log(env.unsafe.eval('1 + 1'));  // prints 2
   //
-  jsg::JsValue eval(jsg::Lock& js, kj::String script, jsg::Optional<kj::String> name);
+  jsg::JsValue eval(jsg::Lock& js,
+      kj::String script,
+      jsg::Optional<kj::String> name,
+      jsg::Optional<bool> fallbackOnlyImports);
 
   using UnsafeEvalFunction = jsg::Function<jsg::Value(jsg::Arguments<jsg::Value>)>;
 

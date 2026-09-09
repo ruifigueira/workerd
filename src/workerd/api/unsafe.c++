@@ -124,10 +124,19 @@ void Stdin::reprl(jsg::Lock& js) {
 }
 #endif
 
-jsg::JsValue UnsafeEval::eval(jsg::Lock& js, kj::String script, jsg::Optional<kj::String> name) {
+jsg::JsValue UnsafeEval::eval(jsg::Lock& js,
+    kj::String script,
+    jsg::Optional<kj::String> name,
+    jsg::Optional<bool> fallbackOnlyImports) {
   js.setAllowEval(true);
   KJ_DEFER(js.setAllowEval(false));
-  auto compiled = jsg::NonModuleScript::compile(js, script, getName(name, EVAL_STR));
+  auto dynamicImportMode = jsg::DynamicImportMode::DEFAULT;
+  if (fallbackOnlyImports.orDefault(false)) {
+    dynamicImportMode = name == kj::none ? jsg::DynamicImportMode::FALLBACK_ONLY_WITHOUT_REFERRER
+                                         : jsg::DynamicImportMode::FALLBACK_ONLY;
+  }
+  auto compiled =
+      jsg::NonModuleScript::compile(js, script, getName(name, EVAL_STR), dynamicImportMode);
   return compiled.runAndReturn(js);
 }
 

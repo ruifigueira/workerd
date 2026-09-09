@@ -41,6 +41,8 @@ struct ResolveObserver {
     // by user-facing APIs like process.getBuiltinModule() that must not
     // expose internal modules or return user bundle overrides.
     PUBLIC_BUILTIN,
+    // Resolves only modules provided by the fallback service.
+    FALLBACK_ONLY,
   };
 
   enum class Source {

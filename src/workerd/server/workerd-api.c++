@@ -926,7 +926,8 @@ kj::Maybe<kj::Own<jsg::modules::Module>> WorkerdApi::compileFallbackModule(
         return jsg::modules::Module::newSynthetic(kj::mv(id), jsg::modules::Module::Type::FALLBACK,
             jsg::modules::Module::newCjsStyleModuleHandler<api::CommonJsModuleContext,
                 JsgWorkerdIsolate_TypeWrapper>(ptr),
-            KJ_MAP(name, named) { return kj::str(name); }, moduleFlags)
+            KJ_MAP(name, named) { return kj::str(name); },
+            moduleFlags | jsg::modules::Module::Flags::COMMON_JS)
             .attach(kj::mv(ownedData));
       }
       KJ_CASE_ONEOF(content, Worker::Script::PythonModule) {
