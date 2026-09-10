@@ -1,0 +1,37 @@
+src/workerd/server/BUILD.bazel
+  s_7eef97e0968964::t_d77c0e48f5203a 308-309
+src/workerd/server/fallback-service.c++
+  s_7eef97e0968964::t_e2499f05caf568 3-4,16-52,67-87,89-114,116-121,126,224,268,278,291,319,334,344,357
+src/workerd/server/fallback-service.h
+  s_7eef97e0968964::t_728a30fe11292a 6,31-33,58-79
+src/workerd/server/server.c++
+  s_7eef97e0968964::t_73e389495656be 5190,5192-5193,5200,5203-5206,5246,5251-5254
+src/workerd/server/tests/module-fallback/module-fallback-test.mjs
+  s_7eef97e0968964::t_b4f370fd8d48f7 56-61,97-109,190-195,301
+src/workerd/util/mimetype.h
+  s_3b94de117771b1::t_fe231a0c23cc87 174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "95ad700bad46c0405ba20e2bb4d0873c4300f65b",
+  "prompts": {},
+  "sessions": {
+    "s_3b94de117771b1": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f86c3919effeBdKzL7Cxlr6FBS",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_7eef97e0968964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f82c5b9b9ffeBdQCT0VqCU1A9F",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}

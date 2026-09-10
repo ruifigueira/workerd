@@ -1,0 +1,61 @@
+src/workerd/jsg/modules-new.c++
+  s_7eef97e0968964::t_04d517aff081af 813-814
+  s_6aaa3704780b80::t_e53caf955c4ad7 2486-2493
+  s_6aaa3704780b80::t_0d7caa1a4157b3 2359-2362
+  s_841950dfc443b0::t_1da4ee0a99bd3b 720-721
+src/workerd/jsg/modules-new-test.c++
+  s_6aaa3704780b80::t_485727ea25e449 3557-3587
+  s_6aaa3704780b80::t_f68bfb0db42610 3549-3550
+src/workerd/api/tests/worker-loader-async-startup-test.js
+  s_841950dfc443b0::t_b30e5aae96ab0d 131,134
+  s_fd3ed061320848::t_9ff9d7ed118628 328-364,368-372
+  s_fd3ed061320848::t_51a2185e0a0ab2 247-248,253-256,298-327,365-367
+src/workerd/io/io-context.c++
+  s_fd3ed061320848::t_ee72bf53967bb7 155-156,168,1366-1375,1378-1387
+src/workerd/io/io-context.h
+  s_fd3ed061320848::t_f0169844e537b4 56-62,286-287,292-293,1270
+src/workerd/server/server.c++
+  s_fd3ed061320848::t_c276a853b2a31d 6335-6337,6340
+src/workerd/io/worker-modules.h
+  s_fd3ed061320848::t_e44390edccab68 113-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "19fa67c2196be34f812e01aab188a9a300ee079f",
+  "prompts": {},
+  "sessions": {
+    "s_6aaa3704780b80": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f7fb4f1bfffetWy0uMcVTwuQPB",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_7eef97e0968964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f82c5b9b9ffeBdQCT0VqCU1A9F",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_841950dfc443b0": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f78d379bdffex7DDSfXXOiG6yc",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    },
+    "s_fd3ed061320848": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f787c3d6affehX2IXnr6soydut",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
