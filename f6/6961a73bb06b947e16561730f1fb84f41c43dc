@@ -1,0 +1,47 @@
+docs/reference/detail/new-module-registry.md
+  s_fd3ed061320848::t_64660035e12b5f 94-97,270-286,347,349-350,364-366,376,394-398,402-412,421,530-531,580-581,638,651-652
+src/workerd/api/tests/worker-loader-async-startup-test.js
+  s_fd3ed061320848::t_390e6273b1d55f 9-11,14-131,156,174,179-180,183-184,215,370,423-455,475-790
+src/workerd/api/worker-loader.c++
+  s_fd3ed061320848::t_3f2e747b5927e9 173,225,227,250-266,268-273,275-282,284-291,295,297-349,351-353,355-356,358-363,409-416
+src/workerd/api/worker-loader.h
+  s_fd3ed061320848::t_25eb93ad1f713b 103-107,136-148,165-169,178-179
+src/workerd/io/io-channels.h
+  s_fd3ed061320848::t_75f51b5e9e21ea 572,606
+src/workerd/io/worker.c++
+  s_fd3ed061320848::t_cac9a833dedb8b 2489-2498
+src/workerd/io/worker.h
+  s_fd3ed061320848::t_122a279bc5b3c7 766-768
+src/workerd/jsg/modules-new-test.c++
+  s_fd3ed061320848::t_c92a6d87cd09b4 2280,2321,3479-3587,3656-3773
+src/workerd/jsg/modules-new.c++
+  s_fd3ed061320848::t_d0e8a01de839e9 21-40,245-249,251-252,673,675-676,732,752,759-783,798-812,890-893,941-958,1228-1233,1237,1276-1281,1303,1306-1310,1319-1320,1337-1340,1358-1361,1406,1427-1428,1554-1559,1561-1582,1584,1602,1689,1804,1806-1808,1811-1814,1827-1867,1871,1874-1881,1884,1887-1888,2003-2009,2291-2294,2300-2303,2323-2331,2338,2342,2345-2376,2430-2433,2456,2471-2493,2523-2527,2540,2542-2544,2546-2548,2552-2554,2630-2650,2709-2712
+src/workerd/jsg/modules-new.h
+  s_fd3ed061320848::t_a715f44d7d20f2 205-209,232-243,296-297,345-346,477-478,537-538,542,554,651-653,691-697,717-727,738,750-758,769,777,785,793-799,833-843,862-866,876,886,901-902
+src/workerd/server/server.c++
+  s_fd3ed061320848::t_3b7c2467acb236 5070-5266,5275,5757-5761,5784,6072,6180-6213,6221,6237-6238,6346-6382
+src/workerd/server/workerd-api.c++
+  s_fd3ed061320848::t_7636a61c0b53b4 873-950,958-959,962-969,1143-1145,1154-1162
+src/workerd/server/workerd-api.h
+  s_fd3ed061320848::t_43da29d3726a92 333-337,339-340,348-349
+types/generated-snapshot/experimental/index.d.ts
+  s_fd3ed061320848::t_6da7d6d86cd20f 4466
+types/generated-snapshot/experimental/index.ts
+  s_fd3ed061320848::t_2df127b0af6377 4475
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "f66961a73bb06b947e16561730f1fb84f41c43dc",
+  "prompts": {},
+  "sessions": {
+    "s_fd3ed061320848": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f787c3d6affehX2IXnr6soydut",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
