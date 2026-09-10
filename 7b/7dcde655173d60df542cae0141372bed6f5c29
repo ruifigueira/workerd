@@ -1,0 +1,19 @@
+docs/reference/detail/new-module-registry.md
+  s_fd3ed061320848::t_8eef87528a7e47 455
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "7b7dcde655173d60df542cae0141372bed6f5c29",
+  "prompts": {},
+  "sessions": {
+    "s_fd3ed061320848": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f787c3d6affehX2IXnr6soydut",
+        "model": "claude-fable-5-1"
+      },
+      "human_author": "Rui Figueira <rfigueira@cloudflare.com>"
+    }
+  }
+}
