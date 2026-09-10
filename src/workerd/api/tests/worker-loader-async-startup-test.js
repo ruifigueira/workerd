@@ -269,6 +269,20 @@ export class Outbound extends WorkerEntrypoint {
           return Response.json({
             esModule: 'globalThis.popoverPolyfilled = true;',
           });
+        case 'file:///bundle/shared-a.js':
+        case 'file:///bundle/shared-b.js':
+          return respondWithTrackedConcurrency(() =>
+            Response.json({
+              esModule: `
+                import dep from './shared-dep.js';
+                export default '${resolution.specifier.at(-4)}:' + dep;
+              `,
+            })
+          );
+        case 'file:///bundle/shared-dep.js':
+          return respondWithTrackedConcurrency(() =>
+            Response.json({ esModule: "export default 'dep';" })
+          );
         case 'file:///bundle/fanout-main.js':
           return Response.json({
             esModule: `
@@ -1332,6 +1346,49 @@ export const runtimeDynamicImportConditionalPolyfill = {
       'file:///bundle/polyfill-entry.js',
     ]);
     assertPolyfillGraphFetched(requests.slice(1));
+  },
+};
+
+// Concurrent imports whose static graphs share a missing dependency issue one fetch
+// for it: the later import waits on the fetch the earlier one started.
+export const runtimeDynamicImportsShareInFlightFetches = {
+  async test(ctrl, env, ctx) {
+    moduleFallbackRequests = [];
+    const worker = env.loader.load({
+      compatibilityDate: '2025-01-01',
+      allowExperimental: true,
+      compatibilityFlags: [
+        'allow_insecure_inefficient_logged_eval',
+        'dynamic_worker_async_startup',
+        'new_module_registry',
+      ],
+      mainModule: 'main.js',
+      modules: {
+        'main.js': `
+          export default {
+            async fetch() {
+              const [a, b] = await Promise.all([
+                import('./shared-a.js'),
+                import('./shared-b.js'),
+              ]);
+              return new Response(a.default + '|' + b.default);
+            },
+          };
+        `,
+      },
+      globalOutbound: ctx.exports.Outbound({}),
+    });
+
+    const response = await worker.getEntrypoint().fetch('https://example.com/');
+    assert.strictEqual(await response.text(), 'a:dep|b:dep');
+    assert.deepStrictEqual(
+      moduleFallbackRequests.map(({ specifier }) => specifier).sort(),
+      [
+        'file:///bundle/shared-a.js',
+        'file:///bundle/shared-b.js',
+        'file:///bundle/shared-dep.js',
+      ]
+    );
   },
 };
 

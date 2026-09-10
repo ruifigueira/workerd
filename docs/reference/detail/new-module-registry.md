@@ -431,6 +431,13 @@ Static imports resolve synchronously inside V8's InstantiateModule(), so
 this is the only place asynchronous fetching can happen: before V8 asks.
 Fetch latency for a graph therefore scales with its depth, not its size.
 
+Every fetch goes through `IsolateModuleRegistry::fetchAndStore`, which keeps
+one in-flight promise per normalized specifier URL. Concurrent operations that
+miss the same specifier wait on the first fetch instead of starting another, so
+the resolver is asked once per URL and any request budget it enforces is charged
+once. The entry is removed when the fetch settles, success or failure, so a miss
+after a failed fetch is fetched again.
+
 Deferred main-module evaluation for dynamic Worker startup
 (`ModuleRegistry::tryResolveMainModuleAsync`) uses the same steps c-f. The
 main module itself may be a miss the asynchronous resolver supplies; its

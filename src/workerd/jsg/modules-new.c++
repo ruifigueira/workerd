@@ -833,9 +833,49 @@ class IsolateModuleRegistry final {
     return misses;
   }
 
-  // Fetches every miss through the asynchronous resolver at the same time and stores
-  // each result in the fallback bundle as it arrives. The promise resolves once every
-  // result is stored and rejects with the first failure.
+  // Fetches one miss through the asynchronous resolver and stores the result in the
+  // fallback bundle. The returned promise settles once the module is stored, or
+  // rejects with the fetch or store failure.
+  //
+  // Concurrent operations that miss the same specifier share one fetch: the first
+  // caller starts it and later callers wait on the same promise. The resolver is
+  // asked once, so a shared miss is charged once against any request budget it
+  // enforces. Whoever waits does not need the result; once it is stored, restarting
+  // the operation finds the module in the registry. The fallback bundle keys stored
+  // modules by URL alone, so URL is the right key here too: imports of one URL under
+  // different resolution types share the definition and receive distinct instances
+  // from `resolveWithCaching`.
+  //
+  // A settled entry is removed whether the fetch succeeded or failed, so a later
+  // operation that misses the same specifier after a failure fetches it again.
+  Promise<void> fetchAndStore(Lock& js, OwnedResolveContext context) {
+    auto key = kj::str(context.normalizedSpecifier.getHref());
+    KJ_IF_SOME(inFlight, inFlightFetches.find(key)) {
+      return inFlight.whenResolved(js);
+    }
+
+    auto fetch = KJ_ASSERT_NONNULL(inner.resolveAsync(js, kj::mv(context)),
+        "fetching a missing module requires a registry with an asynchronous resolver");
+    auto stored = fetch.then(js, [](Lock& js, AsyncResolveResult result) {
+      auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
+      registry.inner.storeAsyncResolution(
+          result.context.asResolveContext(), kj::mv(result.resolution));
+    });
+    // The erasure runs before any waiter's continuation: waiters branch off the
+    // tracked promise, which settles only after these handlers complete.
+    auto tracked = stored.then(js, [key = kj::str(key)](Lock& js) {
+      IsolateModuleRegistry::from(js.v8Isolate).inFlightFetches.erase(key);
+    }, [key = kj::str(key)](Lock& js, Value error) {
+      IsolateModuleRegistry::from(js.v8Isolate).inFlightFetches.erase(key);
+      js.throwException(kj::mv(error));
+    });
+    auto& entry = inFlightFetches.insert(kj::mv(key), kj::mv(tracked));
+    return entry.value.whenResolved(js);
+  }
+
+  // Fetches every miss at the same time and stores each result in the fallback
+  // bundle as it arrives. The promise resolves once every result is stored and
+  // rejects with the first failure.
   Promise<void> fetchMissingModules(Lock& js, kj::Vector<OwnedResolveContext> misses) {
     struct Join final: public kj::Refcounted {
       Join(size_t remaining, Promise<void>::Resolver resolver)
@@ -863,23 +903,16 @@ class IsolateModuleRegistry final {
     // Start every fetch before attaching any continuation: a resolver that throws
     // (for example when it enforces a request budget) then fails this import before
     // the join holds any outstanding count, instead of leaving it settled never.
-    kj::Vector<Promise<AsyncResolveResult>> fetches(misses.size());
+    kj::Vector<Promise<void>> fetches(misses.size());
     for (auto& miss: misses) {
-      fetches.add(KJ_ASSERT_NONNULL(inner.resolveAsync(js, kj::mv(miss)),
-          "prefetch requires a registry with an asynchronous resolver"));
+      fetches.add(fetchAndStore(js, kj::mv(miss)));
     }
 
     auto [promise, resolver] = js.newPromiseAndResolver<void>();
     auto join = kj::rc<Join>(fetches.size(), kj::mv(resolver));
     for (auto& fetch: fetches) {
-      fetch.then(js, [join = join.addRef()](Lock& js, AsyncResolveResult result) mutable {
-        js.tryCatch([&] {
-          auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
-          registry.inner.storeAsyncResolution(
-              result.context.asResolveContext(), kj::mv(result.resolution));
-        }, [&](Value error) { join->fail(js, kj::mv(error)); });
-        join->finishOne(js);
-      }, [join = join.addRef()](Lock& js, Value error) mutable {
+      fetch.then(js, [join = join.addRef()](Lock& js) mutable { join->finishOne(js); },
+          [join = join.addRef()](Lock& js, Value error) mutable {
         join->fail(js, kj::mv(error));
         join->finishOne(js);
       });
@@ -896,14 +929,9 @@ class IsolateModuleRegistry final {
     KJ_IF_SOME(unresolved, lastUnresolvedContext) {
       auto unresolvedContext = kj::mv(unresolved);
       lastUnresolvedContext = kj::none;
-      KJ_IF_SOME(resolution, inner.resolveAsync(js, kj::mv(unresolvedContext))) {
-        return kj::mv(resolution)
-            .then(js,
-                [restart = kj::mv(restart)](
-                    Lock& js, AsyncResolveResult result) mutable -> Promise<Value> {
-          auto& registry = IsolateModuleRegistry::from(js.v8Isolate);
-          registry.inner.storeAsyncResolution(
-              result.context.asResolveContext(), kj::mv(result.resolution));
+      if (inner.supportsAsyncResolution()) {
+        return fetchAndStore(js, kj::mv(unresolvedContext))
+            .then(js, [restart = kj::mv(restart)](Lock& js) mutable -> Promise<Value> {
           return restart(js);
         });
       }
@@ -930,9 +958,10 @@ class IsolateModuleRegistry final {
     // V8 resolves static imports synchronously inside InstantiateModule(), so
     // every module in the graph must already be in the registry. Find the
     // missing ones first, fetch them together, and start over; the rescan on the
-    // next pass picks up dependencies the fetched modules add. The scan resolves
-    // each edge once more than instantiation alone would, against the resolution
-    // cache; that is cheap next to one fetch round trip.
+    // next pass picks up dependencies the fetched modules add. Each pass re-walks
+    // the already-resolved part of the graph against the resolution cache, so an
+    // edge near the root is resolved once per pass; that is hash lookups and URL
+    // normalization, cheap next to one fetch round trip per level.
     if (moduleDef.isEsm() && inner.supportsAsyncResolution()) {
       auto misses = collectMissingStaticImports(js, module);
       if (misses.size() > 0) {
@@ -1467,6 +1496,10 @@ class IsolateModuleRegistry final {
   const ModuleRegistry& inner;
   const CompilationObserver& observer;
   kj::Maybe<OwnedResolveContext> lastUnresolvedContext;
+
+  // Fetches through the asynchronous resolver that have not yet stored their result,
+  // keyed by normalized specifier URL. See fetchAndStore().
+  kj::HashMap<kj::String, Promise<void>> inFlightFetches;
 
   const CompilationObserver& getObserver() const {
     return observer;
